@@ -189,6 +189,12 @@ const OPENSKY_SOURCE_STALE_MS = 120_000;
 // ---------------------------------------------------------------------------
 /** Ordered list of Overpass API mirrors; tried sequentially on failure/rate-limit. */
 const OVERPASS_UPSTREAMS = [
+  // Only mirror reachable from this network (verified 2026-09-03: 1402 ways).
+  // The four below all drop TCP here — port 80 and 443 alike — so they are kept
+  // as fallback only; leading with them cost 22 s per request before failing.
+  // NB: overpass.openstreetmap.fr is reachable but 403s this proxy's User-Agent,
+  // so it is deliberately not listed.
+  'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
   'https://overpass-api.de/api/interpreter',
   'https://overpass.kumi.systems/api/interpreter',
   'https://lz4.overpass-api.de/api/interpreter',
