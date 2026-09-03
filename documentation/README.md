@@ -43,6 +43,7 @@ graph LR
   F --> F1["bootstrap-and-rendering"]
   F --> F2["layer-system"]
   F --> F3["data-layers-reference"]
+  F --> F4["modularity-and-extending"]
 
   G --> G1["map-stack"]
   G --> G2["motion-and-symbology"]
@@ -94,6 +95,7 @@ without the other leaves a gap:
 | **[bootstrap-and-rendering.md](bootstrap-and-rendering.md)** | Startup order, Cesium viewer construction, first-run launcher, the idle render governor | Nothing fetches before a mission tile is clicked. The governor flips Cesium into `requestRenderMode` when nothing animates — **discrete mutations must call `governorRequestRender()`** |
 | **[layer-system.md](layer-system.md)** | `DataLayerManager`, lifecycle vocabulary, intent epochs, presentation gate, feed health | Four states **plus an uncertainty bit**. Only the latest request may publish settled visibility |
 | **[data-layers-reference.md](data-layers-reference.md)** | Every layer: source, module, proxy, cadence — plus the fidelity taxonomy | Measured vs propagated vs interpolated vs **modeled**. The traffic dots are not vehicles |
+| **[modularity-and-extending.md](modularity-and-extending.md)** | How pluggable it is, the layer contract, every registration touch point | The runtime is modular; **registration is centralized and seals at boot** |
 
 ### The globe
 
@@ -133,7 +135,7 @@ Pick the row that matches what you're doing.
 | Task | Read, in order |
 |---|---|
 | **New to the codebase** | [bootstrap-and-rendering](bootstrap-and-rendering.md) → [layer-system](layer-system.md) → [data-layers-reference](data-layers-reference.md) → [radio](radio.md) *(as the worked example)* |
-| **Adding a data layer** | [layer-system](layer-system.md) *(checklist at the end)* → [server-proxies](server-proxies.md) *(checklist at the end)* → [state-and-sharelinks](state-and-sharelinks.md) *(serialization disposition)* → [`DATA_SOURCES.md`](../DATA_SOURCES.md) |
+| **Adding a data source** | [modularity-and-extending](modularity-and-extending.md) *(start here — it has the full checklist)* → [server-proxies](server-proxies.md) → [`DATA_SOURCES.md`](../DATA_SOURCES.md) |
 | **A layer won't load** | [layer-system](layer-system.md) *(feed health)* → [server-proxies](server-proxies.md) → check the server log; proxies sanitize what reaches the browser |
 | **Traffic won't load** | [data-layers-reference](data-layers-reference.md) — it needs **two** feeds; check `/api/overpass` before suspecting TomTom |
 | **Something renders stale or not at all** | [bootstrap-and-rendering](bootstrap-and-rendering.md) — a missing `governorRequestRender()` is the classic cause |
