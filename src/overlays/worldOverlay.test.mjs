@@ -7,7 +7,7 @@ import {
   keyholeLabelAlphaFromGeometry,
   setKeyholeFadeTuning,
 } from '../celestialRing.js';
-import { createCctvThumbnailOverlayEntry, createFrameSlot } from '../data/cctvCards.js';
+import { createThumbnailOverlayEntry, createFrameSlot } from './thumbnailOverlayEntry.js';
 import { combinedOverlayAlpha } from './worldOverlayDraw.js';
 import {
   AMBIENT_CARD_COLLISION_CAPACITY,
@@ -1659,7 +1659,7 @@ test('CCTV stable frame slots gate ambient chrome and wire the exact host hit re
   const env = installMockEnvironment({ width: 500, height: 400, dpr: 1 });
   initWorldOverlay(env.viewer);
   const slot = createFrameSlot();
-  const entry = createCctvThumbnailOverlayEntry({
+  const entry = createThumbnailOverlayEntry({
     id: 'cam-a',
     position: position(),
     title: 'Main & Fifth',
@@ -1707,7 +1707,7 @@ test('CCTV stable frame slots gate ambient chrome and wire the exact host hit re
 test('pinned CCTV chrome may paint before frame one while ordinary safe-top policy still yields', () => {
   const env = installMockEnvironment({ width: 500, height: 400, dpr: 1 });
   initWorldOverlay(env.viewer);
-  const ambient = createCctvThumbnailOverlayEntry({
+  const ambient = createThumbnailOverlayEntry({
     id: 'ambient-top',
     position: new Cesium.Cartesian3(0, 0.9, 0),
     title: 'AMBIENT',
@@ -1715,7 +1715,7 @@ test('pinned CCTV chrome may paint before frame one while ordinary safe-top poli
   });
   ambient.horizonCull = false;
   ambient.maxDistance = Number.POSITIVE_INFINITY;
-  const pinned = createCctvThumbnailOverlayEntry({
+  const pinned = createThumbnailOverlayEntry({
     id: 'pinned-top',
     position: new Cesium.Cartesian3(0.5, 0.9, 0),
     title: 'PINNED',
@@ -1737,7 +1737,7 @@ test('safe-top yield culls an uncontested ambient entry at projection, with a be
   // null it; the below-band twin proves the paint path itself is live.
   const env = installMockEnvironment({ width: 500, height: 400, dpr: 1 });
   initWorldOverlay(env.viewer);
-  const above = createCctvThumbnailOverlayEntry({
+  const above = createThumbnailOverlayEntry({
     id: 'yield-above',
     position: new Cesium.Cartesian3(-0.5, 0.9, 0),
     title: 'ABOVE',
@@ -1745,7 +1745,7 @@ test('safe-top yield culls an uncontested ambient entry at projection, with a be
   });
   above.horizonCull = false;
   above.maxDistance = Number.POSITIVE_INFINITY;
-  const below = createCctvThumbnailOverlayEntry({
+  const below = createThumbnailOverlayEntry({
     id: 'yield-below',
     position: new Cesium.Cartesian3(0.5, 0, 0),
     title: 'BELOW',
@@ -1775,7 +1775,7 @@ test('CCTV host binding preserves the smoothstep scale and 0.45/0.35 fade curve'
     set(value) { paintedAlphas.push(value); },
   });
   initWorldOverlay(env.viewer);
-  const entry = createCctvThumbnailOverlayEntry({
+  const entry = createThumbnailOverlayEntry({
     id: 'altitude-curve',
     position: position(),
     title: 'ALTITUDE',
@@ -1821,7 +1821,7 @@ test('CCTV leader remains one CSS pixel at the 0.35 altitude scale point', () =>
   const env = installMockEnvironment({ width: 500, height: 400, dpr: 1 });
   env.viewer.camera.positionCartographic.height = 9500;
   initWorldOverlay(env.viewer);
-  const entry = createCctvThumbnailOverlayEntry({
+  const entry = createThumbnailOverlayEntry({
     id: 'scaled-leader',
     position: position(),
     title: 'SCALED',
@@ -1848,7 +1848,7 @@ test('active CCTV thumbnail is protected outside the ambient quota and excludes 
   const env = installMockEnvironment({ width: 800, height: 600, dpr: 1 });
   initWorldOverlay(env.viewer);
   const readySlot = () => ({ frame: { ready: true }, stamp: 1 });
-  const active = createCctvThumbnailOverlayEntry({
+  const active = createThumbnailOverlayEntry({
     id: 'active',
     position: position(),
     title: 'ACTIVE',
@@ -1857,7 +1857,7 @@ test('active CCTV thumbnail is protected outside the ambient quota and excludes 
   });
   active.horizonCull = false;
   active.maxDistance = Number.POSITIVE_INFINITY;
-  const ambient = createCctvThumbnailOverlayEntry({
+  const ambient = createThumbnailOverlayEntry({
     id: 'ambient',
     position: position(),
     title: 'AMBIENT',

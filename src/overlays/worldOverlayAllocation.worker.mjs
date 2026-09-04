@@ -25,12 +25,15 @@ import {
   TRACKED_OVERLAY_SOURCE_ID,
   TRACKED_OVERLAY_SOURCE_OPTIONS,
 } from '../data/trackedReadout.js';
-import { CCTV_AMBIENT_CARD_MAX } from '../data/cctvLod.js';
+// Thumbnail cohort size the allocator is benchmarked against. Was CCTV's
+// ambient-card budget; now a fixed benchmark constant, since no live layer
+// publishes thumbnails any more.
+const CCTV_AMBIENT_CARD_MAX = 40;
 import {
-  CCTV_OVERLAY_SOURCE_ID,
-  createCctvThumbnailOverlayEntry,
+  THUMBNAIL_OVERLAY_SOURCE_ID as CCTV_OVERLAY_SOURCE_ID,
+  createThumbnailOverlayEntry as createCctvThumbnailOverlayEntry,
   createFrameSlot,
-} from '../data/cctvCards.js';
+} from './thumbnailOverlayEntry.js';
 import {
   EARTHQUAKE_OVERLAY_COHORT_LIMIT,
   EARTHQUAKE_OVERLAY_COLLISION_CAPACITY,
@@ -47,11 +50,6 @@ import {
   ISS_OVERLAY_SOURCE_OPTIONS,
   createIssOverlayEntry,
 } from '../data/satellites.js';
-import {
-  CCTV_PROJECTION_OVERLAY_SOURCE_ID,
-  CCTV_PROJECTION_OVERLAY_SOURCE_OPTIONS,
-  createCctvProjectionOverlayEntry,
-} from '../data/cctv.js';
 import {
   createRocketMissionMarkerOverlayEntry,
   ROCKET_MISSION_AMBIENT_OVERLAY_COHORT_LIMIT,
@@ -704,6 +702,40 @@ function buildPhase5SatellitesWorkload(count) {
     options: ISS_OVERLAY_SOURCE_OPTIONS,
   });
   return workload;
+}
+
+// Benchmark fixture: the 'selected' overlay lane once carried the active CCTV
+// camera's projection label. CCTV no longer publishes it, but the allocator
+// benchmark still needs a protected single-entry 'selected' cohort, so the
+// entry shape is pinned here instead of imported from a layer.
+const CCTV_PROJECTION_OVERLAY_SOURCE_ID = 'cctv-projection';
+const CCTV_PROJECTION_OVERLAY_SOURCE_OPTIONS = Object.freeze({
+  cohortLimit: 1,
+  collisionCapacity: 0,
+  moving: false,
+});
+
+function createCctvProjectionOverlayEntry({ cameraId, name, position }) {
+  return {
+    id: String(cameraId),
+    position,
+    variant: 'selected',
+    selected: true,
+    protected: true,
+    paintLane: 'selected',
+    collisionGroup: 'ambient-card',
+    priority: Number.MAX_SAFE_INTEGER - 1,
+    title: String(name || cameraId || 'CAMERA'),
+    details: [],
+    accent: '#6be8ff',
+    interactive: false,
+    gapPx: 6,
+    verticalOnly: true,
+    placement: 'above',
+    edgeFade: 'keyhole',
+    horizonCull: true,
+    terrainOcclusion: false,
+  };
 }
 
 function buildPhase5CctvProjectionWorkload(count) {

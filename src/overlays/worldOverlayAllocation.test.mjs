@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { LOCAL_OVERLAY_COHORT_LIMIT } from '../data/localGeojson.js';
 import { FIRMS_AMBIENT_COHORT_LIMIT } from '../data/firmsLabels.js';
 import { vesselOverlayCohortLimit } from '../data/vesselLabels.js';
-import { CCTV_AMBIENT_CARD_MAX } from '../data/cctvLod.js';
+const CCTV_AMBIENT_CARD_MAX = 40;
 import { AMBIENT_CARD_COLLISION_CAPACITY } from './worldOverlay.js';
 import { EARTHQUAKE_OVERLAY_COHORT_LIMIT } from '../data/earthquakes.js';
 import { ROCKET_MISSION_AMBIENT_OVERLAY_COHORT_LIMIT } from '../data/rocketLaunches.js';

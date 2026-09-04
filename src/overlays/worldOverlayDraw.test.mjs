@@ -23,7 +23,7 @@ import {
   placementVariants,
   roundedRectPath,
 } from './worldOverlayDraw.js';
-import { createCctvThumbnailOverlayEntry, createFrameSlot } from '../data/cctvCards.js';
+import { createThumbnailOverlayEntry, createFrameSlot } from './thumbnailOverlayEntry.js';
 import {
   CARD_PLATE_ALPHA,
   DETECTION_PLATE_BAND,
@@ -380,7 +380,7 @@ test('thumbnail painter preserves the shipped CCTV 104x77 geometry and drawing c
   const frameSlot = createFrameSlot();
   frameSlot.frame = { width: 192, height: 108 };
   frameSlot.stamp = 123;
-  const entry = createCctvThumbnailOverlayEntry({
+  const entry = createThumbnailOverlayEntry({
     id: 'cam-a',
     position: { x: 1, y: 2, z: 3 },
     title: 'Main & Fifth Avenue',
