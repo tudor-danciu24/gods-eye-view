@@ -52,12 +52,6 @@ import {
   activateCctvCameraFromWorldClick,
 } from '../cctvFocusRequest.js';
 import { bindTrackingClickGesture, isTrackingClickGesture } from './trackingClickGesture.js';
-import {
-  clearOverlaySource,
-  hitTestWorldOverlay,
-  setOverlayEntries,
-  setOverlaySourceVisible,
-} from '../overlays/worldOverlay.js';
 import { CITY_POIS } from '../locations.js';
 import {
   registerPickOwner,
@@ -68,28 +62,8 @@ import { resolveEllipsoidalGround } from './terrainHeights.js';
 import { cachedGroundFloor, resolveGroundFloorCells, warmGroundFloor } from './groundFloor.js';
 import { sampleMeshFloorCells } from './meshFloorSampler.js';
 import { horizonOccluder } from './iconOrientation.js';
-import { cameraHue, viewshedColors, createFrustumVolumePrimitive } from './cctvViewshed.js';
-import { createCalibrationGizmo, GIZMO_ID_PREFIX } from './cctvGizmo.js';
-import {
-  CCTV_AMBIENT_CARD_MAX,
-  applyEvictionGrace,
-  selectCctvLod,
-  staticFrameRefreshMs,
-} from './cctvLod.js';
-import {
-  CCTV_CARD_FETCH_BURST_LIMIT,
-  CCTV_CARD_FETCH_BURST_SPACING_MS,
-  CCTV_FRAME_CANVAS_W,
-  CCTV_FRAME_CANVAS_H,
-  applyFrameResult,
-  cardFetchPolicy,
-  createCctvThumbnailOverlayEntry,
-  createFrameSlot,
-  declutterCctvCards,
-  CCTV_OVERLAY_SOURCE_ID,
-  planFrameCachePrune,
-  frameFetchDue,
-} from './cctvCards.js';
+import { cctvLocationLabel } from './cctvLabel.js';
+
 import {
   advanceSpriteFocus,
   focusAlphaNeedsWrite,
@@ -98,7 +72,7 @@ import {
   getFocusTarget,
   onFocusTargetAppear,
 } from './focusDeemphasis.js';
-import { holdContinuousRender, releaseContinuousRender } from '../renderGovernor.js';
+import { governorRequestRender, holdContinuousRender, releaseContinuousRender } from '../renderGovernor.js';
 
 // ---------------------------------------------------------------------------
 // API endpoints
@@ -115,8 +89,14 @@ const DEFAULT_UPDATE_INTERVAL_MS = 10000;
 const MIN_AUTO_HOP_SEC = 8;
 const MAX_AUTO_HOP_SEC = 90;
 const HEALTH_SYNC_INTERVAL_MS = 7000;
-const ACTIVE_FRAME_REFRESH_MS = 10000;
-const IDLE_FRAME_REFRESH_MS = 60000;
+// Windy republishes a still roughly every 10 minutes (verified across the
+// Bucharest cohort 2026-09-04: timestamps advance ~10 min, not continuously).
+// The old 10 s / 60 s cadences came from Austin and Caltrans, which pushed
+// frames continuously; against Windy they fetched the SAME bytes ~60x per new
+// frame, which is both waste and a poor fit for Windy's "use the service
+// responsibly" term. Poll at the publication rate instead.
+const ACTIVE_FRAME_REFRESH_MS = 10 * 60 * 1000;
+const IDLE_FRAME_REFRESH_MS = 10 * 60 * 1000;
 const PROJECTION_ACTIVE_REFRESH_MS = 10000;
 const PROJECTION_IDLE_REFRESH_MS = 60000;
 const PROJECTION_CANVAS_WIDTH = 1920;
@@ -275,14 +255,26 @@ const PLANE_OUTLINE_COLOR = Cesium.Color.fromCssColorString('#6be8ff').withAlpha
 // ---------------------------------------------------------------------------
 let _viewer = null;
 let _billboards = null;
+/** @type {Cesium.PolylineCollection|null} Orientation arrows, one per camera. */
+let _arrows = null;
+/** Fixed ground length of the orientation arrow. Deliberately NOT the camera's
+ * rangeM: every Windy pose is a RAW PRIOR, and drawing a range would assert a
+ * viewing distance the source never published. The arrow claims direction only. */
+const ORIENTATION_ARROW_LENGTH_M = 90;
+/** Overhead recentre never descends closer than this to the camera mount. */
+const MIN_OVERHEAD_STANDOFF_M = 400;
+/** Standoff used only when the viewer has no usable current height. */
+const DEFAULT_OVERHEAD_STANDOFF_M = 1_200;
+const ARROW_WIDTH_ACTIVE = 9;
+const ARROW_WIDTH_IDLE = 6;
+let _arrowMaterialActive = null;
+let _arrowMaterialIdle = null;
 let _records = [];
 let _recordById = new Map();
 let _coverageEntities = [];
 let _projectionEntities = [];
 let _enabled = false;
 let _activeCameraId = null;
-let _coverageMode = 'on'; // 'off' | 'on' (wireframes) | 'viewshed' (color-coded volumes)
-let _showProjection = true;
 let _autoHop = false;
 // An explicit empty-space deselect keeps AUTO HOP configured but prevents its
 // timer from silently choosing a replacement. A later explicit activation or
@@ -314,14 +306,13 @@ let _geoLoadDone = 0;
 let _geoProgressNotifier = null;
 // One-shot completion latch for shared floor resolution: the enable-time queue
 // can drain while DEM cells or 3D tiles are still loading. The first update()
-// tick that sees projectionTilesReady() re-enqueues unresolved records ONCE;
+// tick that sees photorealTilesReady() re-enqueues unresolved records ONCE;
 // shared mesh cells remain one-shot and idle ticks stay sample-free. Reset by
 // startGeometryLoadQueue so each enable-time drain gets its own completion pass.
 let _tilesReadyReenqueued = false;
 // Calibration ADJUST mode (viewshed/gizmo design §3c): while true, the active
 // camera renders the direct-manipulation gizmo. Reset on layer disable.
 let _calibrationMode = false;
-let _gizmo = null;
 let _lastTransientNotifyAt = 0;
 // Cached handle on the active Google Photorealistic 3D Tileset, discovered
 // lazily from scene.primitives. Shared mesh-floor sampling is gated on its
@@ -340,136 +331,7 @@ let _mapStackListener = null;
 // pass (removed in destroy). Event-driven only — never a per-frame loop, so
 // the zero-steady-state-work invariant holds.
 let _horizonCullListener = null;
-// Ambient card tier state (2026-07-29 design). The card set is rebuilt only
-// on moveEnd/enable/activation (refreshAmbientCards); frame slots are STABLE
-// objects shared with the overlay host so landed frames appear without an
-// entry rebuild.
-let _cardIds = new Set();
-/** @type {Map<string,{misses:number,since:number}>} */
-let _cardGraceState = new Map();
-/** @type {Map<string,{frame:*, stamp:number, failCount:number, lastAttemptAt:number}>} */
-let _cardFrameSlots = new Map();
-let _cardFetchTimer = 0;
-/** In-flight card-frame fetch count (burst allows up to 4, steady is 1). */
-let _cardFetchInFlightCount = 0;
-/** @type {Set<HTMLImageElement>} in-flight fetches, detached on teardown. */
-const _cardFetchImages = new Set();
-/** @type {Set<string>} camera ids with an in-flight fetch (no double-fetch). */
-const _cardFetchPendingIds = new Set();
-let _cardFetchCount = 0;
-let _cardLastFetchAt = 0;
-let _cardMinFetchSpacingMs = null;
-/** Pacer mode telemetry: 'burst' during cold fill, 'steady' after. */
-let _cardFetchMode = 'steady';
-/**
- * Card budget while the staggered geometry drain is running — the raised
- * 20/28/40 tiers resume when loading completes (see refreshAmbientCards).
- */
-const CCTV_AMBIENT_CARD_DRAIN_CAP = 16;
-// Global static-frame pacing (owner finding 3): the pacer ticks at the burst
-// spacing (250 ms) but cardFetchPolicy gates launches — cold fill (selected
-// cards still missing their FIRST frame) allows up to 4 in-flight fetches at
-// 250 ms spacing; steady state keeps the salvaged Part C gate of at most one
-// request per second with an in-flight fetch blocking the tick, so slow
-// responses only lower the rate.
-const CARD_FETCH_TICK_MS = CCTV_CARD_FETCH_BURST_SPACING_MS;
-// In-view margin so cards whose anchors sit just beyond an edge don't churn
-// while the operator makes minor camera adjustments (Part C recordIsInView).
-const CARD_VIEW_MARGIN = 0.06;
-/** Card leader gap: clears the 24px icon (12px half + breathing room). */
-const CARD_GAP_PX = 16;
-const CCTV_OVERLAY_SOURCE_OPTIONS = Object.freeze({
-  cohortLimit: CCTV_AMBIENT_CARD_MAX,
-  collisionCapacity: CCTV_AMBIENT_CARD_MAX,
-  moving: true,
-  solveIntervalMs: 125,
-});
-export const CCTV_PROJECTION_OVERLAY_SOURCE_ID = 'cctv-projection';
-export const CCTV_PROJECTION_OVERLAY_SOURCE_OPTIONS = Object.freeze({
-  cohortLimit: 1,
-  collisionCapacity: 0,
-  moving: false,
-});
-const DEFAULT_CCTV_OVERLAY_HOST = Object.freeze({
-  clearSource: clearOverlaySource,
-  hitTest: hitTestWorldOverlay,
-  setEntries: setOverlayEntries,
-  setVisible: setOverlaySourceVisible,
-});
-let _cctvOverlayHost = DEFAULT_CCTV_OVERLAY_HOST;
-let _projectionOverlayOwnerId = null;
-/**
- * Product presentation option. Shipped behavior keeps the active camera's
- * thumbnail absent because its monitor plane is the active representation.
- */
-let _activeCameraCardEnabled = false;
-// Hover-summoned card (owner round 2, item B): pointing at a cardless camera
-// icon shows its card immediately as a PINNED entry (budget-exempt, top
-// draw-pass declutter priority).
-/** Min spacing between hover scene.pick calls (event-driven, user gesture). */
-const HOVER_PICK_THROTTLE_MS = 120;
-/** How long the hover card lingers after the pointer leaves the icon. */
-const HOVER_RELEASE_MS = 1_000;
-/** Camera id currently holding the hover-summoned pinned card (or null). */
-let _hoverCardId = null;
-let _hoverReleaseTimer = 0;
-let _hoverLastPickAt = 0;
 
-/** Test seam: republishes host entries through the real push path, so tests
- * can observe the pristine module default without touching the setter. */
-export function _pushAmbientCardEntriesForTest() {
-  pushAmbientCardEntries();
-}
-
-/** Test seam for exercising real layer lifecycle paths without a DOM host. */
-export function _setCctvOverlayHostForTest(host = null) {
-  _cctvOverlayHost = host ? { ...DEFAULT_CCTV_OVERLAY_HOST, ...host } : DEFAULT_CCTV_OVERLAY_HOST;
-  _projectionOverlayOwnerId = null;
-}
-
-/**
- * Build the protected label associated with one active monitor plane.
- * @param {{cameraId: string, name: string, position: Cesium.Cartesian3|Function}} input
- * @returns {Object} Shared-host presentation entry.
- */
-export function createCctvProjectionOverlayEntry({ cameraId, name, position }) {
-  return {
-    id: String(cameraId),
-    position,
-    variant: 'selected',
-    selected: true,
-    protected: true,
-    paintLane: 'selected',
-    collisionGroup: 'ambient-card',
-    priority: Number.MAX_SAFE_INTEGER - 1,
-    title: String(name || cameraId || 'CAMERA'),
-    details: [],
-    accent: '#6be8ff',
-    interactive: false,
-    gapPx: 6,
-    verticalOnly: true,
-    placement: 'above',
-    edgeFade: 'keyhole',
-    horizonCull: true,
-    terrainOcclusion: false,
-  };
-}
-
-/**
- * Configures optional CCTV card presentation without changing card density.
- * The active-camera thumbnail defaults OFF, preserving the shipped behavior
- * where the monitor plane is the camera's sole active representation.
- *
- * @param {Object} [options]
- * @param {boolean} [options.activeCameraCardEnabled=false]
- * @returns {{activeCameraCardEnabled:boolean}}
- */
-export function setCctvCardPresentationOptions({ activeCameraCardEnabled = false } = {}) {
-  _activeCameraCardEnabled = activeCameraCardEnabled === true;
-  if (_enabled) pushAmbientCardEntries();
-  _viewer?.scene?.requestRender?.();
-  return { activeCameraCardEnabled: _activeCameraCardEnabled };
-}
 // True between camera.moveStart and moveEnd — hover picking pauses while the
 // camera is in motion (picks during a flight would fight the reselection).
 let _cameraMoving = false;
@@ -639,21 +501,6 @@ function normalizeCalibration(value = {}) {
 function isDefaultCalibration(calibration) {
   const probe = normalizeCalibration(calibration);
   return Object.keys(DEFAULT_CAMERA_CALIBRATION).every((key) => Math.abs(probe[key] - DEFAULT_CAMERA_CALIBRATION[key]) < 0.0001);
-}
-
-/**
- * Normalizes a coverage-mode request (viewshed design §3b). Accepts the three
- * mode strings plus booleans for `setParams({showCoverage})` back-compat
- * (true → 'on', false → 'off'); anything else keeps the current mode.
- * @param {*} value - Requested mode ('off'|'on'|'viewshed') or boolean.
- * @param {'off'|'on'|'viewshed'} current - Mode to keep when the request is invalid.
- * @returns {'off'|'on'|'viewshed'}
- */
-export function normalizeCoverageMode(value, current) {
-  if (value === true) return 'on';
-  if (value === false) return 'off';
-  if (value === 'off' || value === 'on' || value === 'viewshed') return value;
-  return current;
 }
 
 /**
@@ -874,110 +721,6 @@ function projectPoint(latDeg, lonDeg, bearingDeg, distanceM) {
 }
 
 /**
- * V2 core geometry (design §2a): computes the pitched frustum pyramid — mount
- * point, far-cap (monitor plane) center, and the 4 far-plane corners — purely
- * from the calibrated pose + a caller-supplied ground altitude. ZERO scene
- * queries: ground sampling happens in the caller (one-shot snap), and the
- * obstruction probe passes its clamp in as `rangeOverrideM`.
- *
- * Math (spherical small-angle offsets; sub-centimetre at ≤2.2 km ranges):
- *   mountAlt  = groundAltM + mountHeightM
- *   capCenter = projectPoint(heading, R·cos(pitch)) @ alt mountAlt + R·sin(pitch)
- *   halfW     = R·tan(hFov/2)
- *   vFov      = 2·atan(tan(hFov/2) / (16/9))   → halfH = R·tan(vFov/2)
- *   upOffset  = cos(pitch)·halfH vertical + (−sin(pitch))·halfH along heading
- *   corners   = (capCenter ∓ halfW toward heading∓90°) ± upOffset
- * The cap CENTER altitude clamps to ≥ groundAltM + 2 m (§6 risk: fabricated
- * pitch must never bury the plane's anchor); corners derive rigidly from the
- * clamped center so the wireframe rays always terminate on the plane's
- * corners — the bottom pair may dip below ground (tiles occlude it).
- *
- * @param {Object} camera - Pose: lat, lon, headingDeg, pitchDeg, fovDeg,
- *   rangeM, mountHeightM.
- * @param {number} groundAltM - Ground altitude at the mount (metres).
- * @param {number|null} [rangeOverrideM=null] - Obstruction-probe clamp: caps the
- *   effective range (never lengthens it).
- * @returns {{ rangeM: number, vFovDeg: number, halfW: number, halfH: number,
- *   mount: {lat:number,lon:number,alt:number},
- *   capCenter: {lat:number,lon:number,alt:number},
- *   corners: { tl: Object, tr: Object, br: Object, bl: Object },
- *   topCenter: {lat:number,lon:number,alt:number}, groundAltM: number }}
- */
-export function computeFrustumGeometry(camera, groundAltM, rangeOverrideM = null) {
-  const ground = safeNumber(groundAltM, 0);
-  const poseRange = Math.max(1, safeNumber(camera.rangeM, 700));
-  const override = safeNumber(rangeOverrideM, NaN);
-  const R = Number.isFinite(override) && override > 0 ? Math.min(poseRange, override) : poseRange;
-  const pitch = toRad(clamp(safeNumber(camera.pitchDeg, -17), -89, 89));
-  const hFov = toRad(clamp(safeNumber(camera.fovDeg, 74), 8, 160));
-  const heading = safeNumber(camera.headingDeg, 0);
-  const mountAlt = ground + safeNumber(camera.mountHeightM, 24);
-
-  const horiz = R * Math.cos(pitch);
-  const vert = R * Math.sin(pitch);
-  const capLL = projectPoint(camera.lat, camera.lon, heading, horiz);
-  const capAlt = mountAlt + vert;
-
-  const halfW = R * Math.tan(hFov / 2);
-  const vFovRad = 2 * Math.atan(Math.tan(hFov / 2) / PROJECTION_VERT_ASPECT);
-  const halfH = R * Math.tan(vFovRad / 2);
-
-  // In-plane "up" of the pitched cap, decomposed into a vertical part and a
-  // horizontal part along the heading (pitch < 0 tilts the cap's top forward).
-  const upVert = Math.cos(pitch) * halfH;
-  const upHoriz = -Math.sin(pitch) * halfH;
-
-  const capL = projectPoint(capLL.lat, capLL.lon, heading - 90, halfW);
-  const capR = projectPoint(capLL.lat, capLL.lon, heading + 90, halfW);
-  // Ground clamp (§6 risk): lift the CAP CENTER once so a fabricated pitch
-  // never buries the plane's anchor — then derive the corners RIGIDLY from the
-  // lifted center. Clamping each corner independently flattened the wireframe
-  // into a ground-hugging fan while the rigid plane kept its height (owner
-  // field test 2026-07-04): the corner rays must always terminate exactly on
-  // the monitor plane's corners. The bottom pair may dip below ground; the 3D
-  // tiles occlude that portion, exactly as they do for the plane itself.
-  const minAlt = ground + FRUSTUM_GROUND_CLEARANCE_M;
-  const capAltClamped = Math.max(minAlt, capAlt);
-  const corner = (base, sign) => {
-    const ll = projectPoint(base.lat, base.lon, heading, sign * upHoriz);
-    return { lat: ll.lat, lon: ll.lon, alt: capAltClamped + sign * upVert };
-  };
-
-  const topCenter = corner(capLL, 1);
-  return {
-    rangeM: R,
-    vFovDeg: Cesium.Math.toDegrees(vFovRad),
-    halfW,
-    halfH,
-    mount: { lat: camera.lat, lon: camera.lon, alt: mountAlt },
-    capCenter: { lat: capLL.lat, lon: capLL.lon, alt: capAltClamped },
-    corners: {
-      tl: corner(capL, 1),
-      tr: corner(capR, 1),
-      br: corner(capR, -1),
-      bl: corner(capL, -1),
-    },
-    topCenter,
-    groundAltM: ground,
-  };
-}
-
-/**
- * Resolves the obstruction probe's effective-range clamp just short of a hit,
- * with the field-derived 12 m floor used by the original H6 monitor.
- * @param {number} rangeM Nominal camera range.
- * @param {number} hitDistanceM Distance to the first obstruction.
- * @returns {number|null} Clamp range, or null when the hit does not shorten it.
- */
-export function activationProbeClampRange(rangeM, hitDistanceM) {
-  const nominalRange = Number(rangeM);
-  const hitDistance = Number(hitDistanceM);
-  if (!Number.isFinite(nominalRange) || nominalRange <= 0) return null;
-  if (!Number.isFinite(hitDistance) || hitDistance <= 0 || hitDistance >= nominalRange) return null;
-  return Math.max(PROBE_MIN_RANGE_M, hitDistance - PROBE_CLEARANCE_M);
-}
-
-/**
  * Computes the great-circle distance between two points using the haversine formula.
  * @param {number} lat1 - Latitude of point 1 (degrees).
  * @param {number} lon1 - Longitude of point 1 (degrees).
@@ -991,18 +734,6 @@ function haversineKm(lat1, lon1, lat2, lon2) {
   const a = Math.sin(dLat / 2) ** 2
     + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
   return 6371 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-}
-
-/**
- * Computes the area of a circular sector (camera FOV wedge).
- * @param {number} rangeM - Radius in metres.
- * @param {number} fovDeg - Field of view in degrees.
- * @returns {number} Area in km^2.
- */
-function sectorAreaKm2(rangeM, fovDeg) {
-  const theta = toRad(clamp(fovDeg, 12, 170));
-  const areaM2 = 0.5 * rangeM * rangeM * theta;
-  return areaM2 / 1_000_000;
 }
 
 /**
@@ -1168,6 +899,14 @@ function buildCatalogFromSources(rawSources) {
       absoluteHeightM: groundElevationM + mountHeightM,
       pitchDeg,
       license: String(source.license || source.licenseNote || ''),
+      // Windy's API terms require each displayed frame to link to its webcam
+      // page. Carried through so the panel can render it; '' where absent.
+      detailUrl: String(source.detailUrl || ''),
+      // Range -> Windy timelapse embed URL. Server-pinned; the panel only ever
+      // hands these straight to the iframe, never a client-built URL.
+      playerUrls: (source.playerUrls && typeof source.playerUrls === 'object')
+        ? { ...source.playerUrls }
+        : {},
       poseSource,
     };
     ensureCameraPose(camera);
@@ -1175,122 +914,6 @@ function buildCatalogFromSources(rawSources) {
   }
 
   return catalog;
-}
-
-/**
- * Reports whether the active Google Photorealistic 3D Tileset (if any) has
- * finished loading the tiles in view. Shared mesh-floor sampling is gated on
- * this so a one-shot cell never bakes in a miss from still-streaming tiles.
- * Discovers + caches the tileset lazily from scene
- * primitives (the CCTV module holds only a `_viewer` reference). When no
- * tileset is present (OSM fallback) this returns true so ground sampling is
- * not permanently blocked.
- *
- * Task 5 (review correction, spec §2): a HIDDEN tileset (`show === false`,
- * i.e. a globe stack is active) must NOT report ready — Cesium 1.138's
- * the shared sampler can only inspect *visible* 3D tilesets, so a sample taken
- * against the hidden Google tileset would silently miss.
- *
- * @returns {boolean} True when tiles are loaded AND visible (or no tileset
- *   exists to wait on).
- */
-function projectionTilesReady() {
-  if (!_activeTileset || _activeTileset.isDestroyed?.()) {
-    _activeTileset = null;
-    const primitives = _viewer?.scene?.primitives;
-    if (primitives && typeof primitives.get === 'function') {
-      for (let i = 0; i < primitives.length; i++) {
-        const p = primitives.get(i);
-        if (p instanceof Cesium.Cesium3DTileset && !p.isDestroyed?.()) {
-          _activeTileset = p;
-          break;
-        }
-      }
-    }
-  }
-  if (!_activeTileset) return true;
-  if (_activeTileset.show === false) return false;
-  return _activeTileset.tilesLoaded === true;
-}
-
-/**
- * Converts a computeFrustumGeometry result into the Cartesian3 positions the
- * entities consume. Fresh objects per call (geometry updates are rare —
- * slider/save/activation — and entities must never share scratch objects).
- * @param {Object} geometry - Result of computeFrustumGeometry.
- * @returns {{ mount: Cesium.Cartesian3, capCenter: Cesium.Cartesian3,
- *   tl: Cesium.Cartesian3, tr: Cesium.Cartesian3, br: Cesium.Cartesian3,
- *   bl: Cesium.Cartesian3, label: Cesium.Cartesian3 }}
- */
-function frustumCartesians(geometry) {
-  const at = (p) => Cesium.Cartesian3.fromDegrees(p.lon, p.lat, p.alt);
-  return {
-    mount: at(geometry.mount),
-    capCenter: at(geometry.capCenter),
-    tl: at(geometry.corners.tl),
-    tr: at(geometry.corners.tr),
-    br: at(geometry.corners.br),
-    bl: at(geometry.corners.bl),
-    label: Cesium.Cartesian3.fromDegrees(
-      geometry.topCenter.lon,
-      geometry.topCenter.lat,
-      geometry.topCenter.alt + 1.2
-    ),
-  };
-}
-
-/**
- * Unit ECEF direction of the frustum view axis (heading/pitch) at a position.
- * Used by the plane orientation and the activation obstruction probe — both
- * need the UNCLAMPED axis, so it comes from the pose, not from clamped points.
- * @param {Object} camera - Camera pose (headingDeg, pitchDeg).
- * @param {Cesium.Cartesian3} atPos - ECEF position defining the local ENU frame.
- * @returns {{ dir: Cesium.Cartesian3, up: Cesium.Cartesian3 }} View axis + the
- *   frame's in-plane "up" (both unit, mutually perpendicular).
- */
-function frustumFrameEcef(camera, atPos) {
-  const h = toRad(camera.headingDeg);
-  const p = toRad(camera.pitchDeg);
-  const enu = Cesium.Transforms.eastNorthUpToFixedFrame(atPos);
-  const rot = Cesium.Matrix4.getMatrix3(enu, new Cesium.Matrix3());
-  // ENU components: view axis + the perpendicular "up" of the pitched cap.
-  const dirEnu = new Cesium.Cartesian3(
-    Math.sin(h) * Math.cos(p),
-    Math.cos(h) * Math.cos(p),
-    Math.sin(p)
-  );
-  const upEnu = new Cesium.Cartesian3(
-    -Math.sin(p) * Math.sin(h),
-    -Math.sin(p) * Math.cos(h),
-    Math.cos(p)
-  );
-  return {
-    dir: Cesium.Matrix3.multiplyByVector(rot, dirEnu, new Cesium.Cartesian3()),
-    up: Cesium.Matrix3.multiplyByVector(rot, upEnu, new Cesium.Cartesian3()),
-  };
-}
-
-/**
- * Orientation quaternion for the monitor plane entity: local +Z is the plane
- * normal, pointing BACK along the view axis toward the mount so the textured
- * front face reads correctly from the natural viewpoint (focusCamera flies the
- * viewer to look along the camera heading). Local +X = viewer-right, +Y =
- * frame-up, so the 16:9 texture maps upright and unmirrored. Static geometry —
- * computed only on slider/save/activation, never per frame (§2b).
- * @param {Object} camera - Camera pose.
- * @param {Cesium.Cartesian3} capCenterPos - Plane center in ECEF.
- * @returns {Cesium.Quaternion}
- */
-function planeOrientationFor(camera, capCenterPos) {
-  const frame = frustumFrameEcef(camera, capCenterPos);
-  const right = Cesium.Cartesian3.cross(frame.dir, frame.up, new Cesium.Cartesian3());
-  const normal = Cesium.Cartesian3.negate(frame.dir, new Cesium.Cartesian3());
-  const m = new Cesium.Matrix3(
-    right.x, frame.up.x, normal.x,
-    right.y, frame.up.y, normal.y,
-    right.z, frame.up.z, normal.z
-  );
-  return Cesium.Quaternion.fromRotationMatrix(m);
 }
 
 /**
@@ -1348,126 +971,6 @@ function groundAltFor(record, regime = currentSurfaceRegime()) {
 }
 
 /**
- * FNV-1a over the RGB channels of a downsampled frame. Pure (takes the raw
- * pixel buffer, no DOM) so it is unit-testable.
- *
- * Alpha is skipped deliberately — CCTV stills are opaque, so hashing it would
- * cost a third more work to mix in a constant.
- *
- * @param {Uint8ClampedArray|number[]} data - RGBA pixels, 4 bytes per pixel.
- * @returns {number|null} Unsigned 32-bit signature, or null for empty input.
- */
-export function frameSignatureFromPixels(data) {
-  if (!data || typeof data.length !== 'number' || data.length < 4) return null;
-  let hash = 0x811c9dc5;
-  for (let i = 0; i < data.length; i += 4) {
-    hash = Math.imul(hash ^ data[i], 0x01000193);
-    hash = Math.imul(hash ^ data[i + 1], 0x01000193);
-    hash = Math.imul(hash ^ data[i + 2], 0x01000193);
-  }
-  return hash >>> 0;
-}
-
-/**
- * Signature of the runtime's freshly decoded frame, via a reused 64x36
- * scratch canvas.
- *
- * @param {Object} runtime - Projection runtime holding the decoded `.image`.
- * @returns {number|null} Signature, or null when it cannot be computed (the
- *   caller then treats the frame as changed — the pre-2026-07-30 behavior).
- */
-function projectionFrameSignature(runtime) {
-  const image = runtime?.image;
-  if (!image) return null;
-  if (!runtime.signatureCtx) {
-    const canvas = document.createElement('canvas');
-    canvas.width = FRAME_SIGNATURE_W;
-    canvas.height = FRAME_SIGNATURE_H;
-    runtime.signatureCanvas = canvas;
-    runtime.signatureCtx = canvas.getContext('2d', { willReadFrequently: true });
-  }
-  const ctx = runtime.signatureCtx;
-  if (!ctx) return null;
-  try {
-    ctx.clearRect(0, 0, FRAME_SIGNATURE_W, FRAME_SIGNATURE_H);
-    ctx.drawImage(image, 0, 0, FRAME_SIGNATURE_W, FRAME_SIGNATURE_H);
-    return frameSignatureFromPixels(
-      ctx.getImageData(0, 0, FRAME_SIGNATURE_W, FRAME_SIGNATURE_H).data
-    );
-  } catch {
-    // Tainted canvas (a cross-origin source served without CORS) or a decode
-    // race. Returning null means "assume changed", so behavior degrades to
-    // the unconditional redraw this optimization replaced.
-    return null;
-  }
-}
-
-/**
- * Blits the latest projection canvas into the next of two alternating
- * offscreen buffer canvases and returns it (H5).
- *
- * Two buffers are required because Cesium's Material image path re-uploads a
- * canvas texture only when the uniform receives a NEW object reference —
- * redrawing the same canvas in place is invisible to the GPU. Alternating
- * references forces a texture recreate, which at <=1Hz and 1080p is cheap.
- *
- * @param {Object} runtime - Projection runtime with `.canvas`.
- * @returns {HTMLCanvasElement|null} The freshly painted buffer, or null.
- */
-function paintNextProjectionBuffer(runtime) {
-  if (!runtime?.canvas) return null;
-  if (!runtime.buffers) {
-    runtime.buffers = [0, 1].map(() => {
-      const buffer = document.createElement('canvas');
-      buffer.width = PROJECTION_CANVAS_WIDTH;
-      buffer.height = PROJECTION_CANVAS_HEIGHT;
-      return buffer;
-    });
-    runtime.bufferIndex = 0;
-  }
-  runtime.bufferIndex = (runtime.bufferIndex + 1) % 2;
-  const buffer = runtime.buffers[runtime.bufferIndex];
-  const ctx = buffer.getContext('2d');
-  if (!ctx) return null;
-  ctx.clearRect(0, 0, buffer.width, buffer.height);
-  ctx.drawImage(runtime.canvas, 0, 0);
-  return buffer;
-}
-
-/**
- * Pushes fresh pixels into the monitor plane material. Called every
- * projection tick.
- *
- * Video feeds are skipped entirely — their HTMLVideoElement uniform is
- * updated per-frame by Cesium natively (H5). Image/webcam-frame feeds swap
- * the double-buffer canvas reference, throttled to PROJECTION_TEXTURE_SWAP_MS.
- *
- * @param {Object} record - Camera record with an initialized projection runtime.
- */
-function refreshProjectionTextures(record) {
-  const runtime = record?.projection;
-  if (!runtime || runtime.mode === 'video') return;
-  const now = Date.now();
-  if (now - safeNumber(runtime.lastTextureSwapAt, 0) < PROJECTION_TEXTURE_SWAP_MS) return;
-
-  const planeShowing = !!(runtime.planeEntity?.show && runtime.planeMaterial);
-  if (!planeShowing) return;
-
-  // Only swap when the canvas content actually changed since the last swap.
-  // Frames land every ~10 s but this runs at 1 Hz — swapping an UNCHANGED
-  // canvas re-uploads the texture for nothing, and each material image
-  // reassignment is a flash opportunity on the live plane (owner field test
-  // 2026-07-04: intermittent white flashes on the monitor plane).
-  if (runtime.canvasStamp === runtime.lastSwappedCanvasStamp) return;
-
-  const buffer = paintNextProjectionBuffer(runtime);
-  if (!buffer) return;
-  runtime.lastTextureSwapAt = now;
-  runtime.lastSwappedCanvasStamp = runtime.canvasStamp;
-  runtime.planeMaterial.image = buffer;
-}
-
-/**
  * Builds the URL for fetching a camera frame image from the backend.
  * Includes a tick parameter to control cache invalidation cadence.
  * @param {Object} camera - Camera object.
@@ -1497,469 +1000,6 @@ function frameUrlFor(camera, refreshMs = ACTIVE_FRAME_REFRESH_MS) {
  */
 function mediaUrlFor(camera) {
   return `${MEDIA_ENDPOINT}/${encodeURIComponent(camera.id)}?ts=${Math.floor(Date.now() / 15000)}`;
-}
-
-/**
- * Paints a placeholder frame onto the projection canvas when no live feed
- * image or video is available. Shows camera name, city, and status text
- * over a dark gradient with tactical border lines.
- * @param {CanvasRenderingContext2D} ctx - 2D context for the projection canvas.
- * @param {Object} camera - Camera object for label info.
- * @param {Object|null} [health=null] - Health state for status message.
- */
-function paintProjectionPlaceholder(ctx, camera, health = null) {
-  if (!ctx) return;
-  const w = PROJECTION_CANVAS_WIDTH;
-  const h = PROJECTION_CANVAS_HEIGHT;
-  ctx.clearRect(0, 0, w, h);
-  const g = ctx.createLinearGradient(0, 0, w, h);
-  g.addColorStop(0, '#05111a');
-  g.addColorStop(1, '#01070c');
-  ctx.fillStyle = g;
-  ctx.fillRect(0, 0, w, h);
-
-  const label = String(camera?.name || 'CCTV');
-  const city = String(camera?.city || 'GLOBAL');
-  const status = String(health?.message || health?.status || camera?.feedType || 'NO FEED').toUpperCase();
-
-  ctx.strokeStyle = 'rgba(0, 220, 255, 0.24)';
-  ctx.lineWidth = 2;
-  ctx.strokeRect(18, 18, w - 36, h - 36);
-  ctx.strokeRect(36, 36, w - 72, h - 72);
-
-  ctx.fillStyle = 'rgba(170, 242, 255, 0.95)';
-  ctx.font = '600 32px "JetBrains Mono", monospace';
-  ctx.fillText(label.slice(0, 42), 46, 74);
-  ctx.fillStyle = 'rgba(127, 216, 231, 0.8)';
-  ctx.font = '500 24px "JetBrains Mono", monospace';
-  ctx.fillText(city.toUpperCase(), 46, 112);
-  ctx.font = '500 21px "JetBrains Mono", monospace';
-  ctx.fillText(status.slice(0, 58), 46, h - 42);
-}
-
-/**
- * Re-derives the monitor plane entity's placement (position, orientation,
- * dimensions) + label from the record's current frustum geometry, so the plane
- * always caps the wireframe exactly (corner rays terminate on its corners).
- * No-op when the record has no plane runtime (idle neighbors have no plane).
- * @param {Object} record - Camera record.
- */
-function updatePlanePlacement(record) {
-  const runtime = record?.projection;
-  if (!runtime?.planeEntity) return;
-  const geometry = record.frustumGeometry
-    || computeFrustumGeometry(record.camera, groundAltFor(record), record.probeClampRangeM);
-  const positions = record.frustumPositions || frustumCartesians(geometry);
-  runtime.planeEntity.position = positions.capCenter;
-  runtime.planeEntity.orientation = planeOrientationFor(record.camera, positions.capCenter);
-  if (runtime.planeEntity.plane) {
-    runtime.planeEntity.plane.dimensions = new Cesium.Cartesian2(
-      geometry.halfW * 2,
-      geometry.halfH * 2
-    );
-  }
-  if (runtime.labelPosition) {
-    Cesium.Cartesian3.clone(positions.label, runtime.labelPosition);
-  }
-}
-
-/**
- * Clear the active monitor-plane label source and ownership marker.
- */
-function clearProjectionOverlay() {
-  _cctvOverlayHost.clearSource(CCTV_PROJECTION_OVERLAY_SOURCE_ID);
-  _cctvOverlayHost.setVisible(CCTV_PROJECTION_OVERLAY_SOURCE_ID, false);
-  _projectionOverlayOwnerId = null;
-}
-
-/**
- * Shows/hides the monitor plane and its associated shared-host label.
- * @param {Object} runtime - Projection runtime.
- * @param {boolean} visible
- */
-function setPlaneVisible(runtime, visible) {
-  if (!runtime) return;
-  if (runtime.planeEntity) runtime.planeEntity.show = !!visible;
-  if (visible && runtime.overlayEntry && runtime.cameraId) {
-    if (_projectionOverlayOwnerId !== runtime.cameraId) {
-      _cctvOverlayHost.setEntries(
-        CCTV_PROJECTION_OVERLAY_SOURCE_ID,
-        [runtime.overlayEntry],
-        CCTV_PROJECTION_OVERLAY_SOURCE_OPTIONS,
-      );
-      _cctvOverlayHost.setVisible(CCTV_PROJECTION_OVERLAY_SOURCE_ID, true);
-      _projectionOverlayOwnerId = runtime.cameraId;
-    }
-  } else if (_projectionOverlayOwnerId === runtime.cameraId) {
-    clearProjectionOverlay();
-  }
-}
-
-/** Create the native monitor plane plus its cached host-label presentation. */
-function createProjectionPlane(record, runtime, geometry, positions) {
-  runtime.labelPosition ||= new Cesium.Cartesian3();
-  Cesium.Cartesian3.clone(positions.label, runtime.labelPosition);
-  runtime.cameraId = String(record.camera.id);
-  runtime.overlayEntry = createCctvProjectionOverlayEntry({
-    cameraId: runtime.cameraId,
-    name: record.camera.name,
-    position: () => runtime.labelPosition,
-  });
-  runtime.planeEntity = _viewer.entities.add({
-    id: `cctv-${record.camera.id}-plane`,
-    properties: { cctvCameraId: record.camera.id },
-    show: false,
-    position: positions.capCenter,
-    orientation: planeOrientationFor(record.camera, positions.capCenter),
-    plane: {
-      plane: new Cesium.Plane(Cesium.Cartesian3.UNIT_Z, 0.0),
-      dimensions: new Cesium.Cartesian2(geometry.halfW * 2, geometry.halfH * 2),
-      material: runtime.planeMaterial,
-      outline: true,
-      outlineColor: PLANE_OUTLINE_COLOR,
-    },
-  });
-  return runtime.planeEntity;
-}
-
-/**
- * Create the production monitor-plane/host-label pair without media setup.
- * @param {Object} viewer Cesium viewer seam.
- * @param {Object} record CCTV runtime record.
- * @returns {Object} Projection runtime.
- */
-export function _createCctvProjectionPlaneForTest(viewer, record) {
-  _viewer = viewer;
-  const geometry = record.frustumGeometry
-    || computeFrustumGeometry(record.camera, groundAltFor(record), record.probeClampRangeM);
-  const positions = record.frustumPositions || frustumCartesians(geometry);
-  record.frustumGeometry = geometry;
-  record.frustumPositions = positions;
-  const runtime = {
-    cameraId: String(record.camera.id),
-    planeEntity: null,
-    labelPosition: new Cesium.Cartesian3(),
-    overlayEntry: null,
-    planeMaterial: new Cesium.ColorMaterialProperty(Cesium.Color.WHITE),
-  };
-  createProjectionPlane(record, runtime, geometry, positions);
-  record.projection = runtime;
-  return runtime;
-}
-
-/**
- * Exercise the production geometry-to-plane-and-label cache update.
- * @param {Object} record CCTV runtime record.
- */
-export function _updateCctvProjectionPlaneForTest(record) {
-  updatePlanePlacement(record);
-}
-
-/**
- * Creates the projection runtime for a camera record: an offscreen canvas,
- * the monitor plane plus associated host label, and either an
- * <img> or <video> element depending on the feed type.
- *
- * The plane is the only projection representation (v2): the frustum's far cap,
- * perpendicular to the view axis (§2b — never billboarded; a wall primitive
- * can't pitch, the plane can). It is textured with the live frame: video
- * element direct, canvas double-buffer otherwise.
- *
- * @param {Object} record - Camera record.
- * @returns {Object|null} Projection runtime, or null if no viewer.
- */
-function createProjectionRuntime(record) {
-  if (!_viewer) return null;
-  const canvas = document.createElement('canvas');
-  canvas.width = PROJECTION_CANVAS_WIDTH;
-  canvas.height = PROJECTION_CANVAS_HEIGHT;
-  const ctx = canvas.getContext('2d', { alpha: true });
-
-  const feedType = normalizeFeedType(record.camera.feedType);
-  const mode = isVideoFeedType(feedType) ? 'video' : 'image';
-  const runtime = {
-    mode,
-    canvas,
-    ctx,
-    image: null,
-    video: null,
-    planeEntity: null,
-    cameraId: String(record.camera.id),
-    labelPosition: new Cesium.Cartesian3(),
-    overlayEntry: null,
-    planeMaterial: null,
-    buffers: null,
-    bufferIndex: 0,
-    lastTextureSwapAt: 0,
-    lastImageRefreshAt: 0,
-    imageReady: false,
-    imageLoading: false,
-    imageStamp: 0,
-    drawnImageStamp: -1,
-    // Signature of the pixels currently ON the canvas, plus the reused 64x36
-    // scratch used to compute it. null = "nothing known", which always redraws.
-    lastFrameSignature: null,
-    signatureCanvas: null,
-    signatureCtx: null,
-    lastPlaceholderPaintAt: 0,
-    // canvasStamp increments on every canvas write (frame blit / placeholder
-    // paint); lastSwappedCanvasStamp trails it so refreshProjectionTextures
-    // only re-uploads the plane texture when there is genuinely new content.
-    canvasStamp: 1,
-    lastSwappedCanvasStamp: 0,
-  };
-
-  paintProjectionPlaceholder(ctx, record.camera);
-
-  if (mode === 'video') {
-    const video = document.createElement('video');
-    video.muted = true;
-    video.loop = true;
-    video.autoplay = true;
-    video.playsInline = true;
-    video.crossOrigin = 'anonymous';
-    video.preload = 'auto';
-    video.src = mediaUrlFor(record.camera);
-    video.addEventListener('canplay', () => {
-      video.play().catch(() => {});
-    });
-    runtime.video = video;
-  } else {
-    const img = new Image();
-    img.decoding = 'async';
-    img.crossOrigin = 'anonymous';
-    img.onload = () => {
-      runtime.imageLoading = false;
-      runtime.imageReady = true;
-      runtime.imageStamp = Date.now();
-    };
-    img.onerror = () => {
-      runtime.imageLoading = false;
-      runtime.imageReady = false;
-    };
-    runtime.image = img;
-  }
-
-  // Monitor plane = the frustum's far cap: video feeds bind the video element
-  // directly (Cesium updates video-backed entity materials per frame); image
-  // feeds start on the placeholder canvas and switch to double-buffer swaps
-  // at <=1Hz.
-  const geometry = record.frustumGeometry
-    || computeFrustumGeometry(record.camera, groundAltFor(record), record.probeClampRangeM);
-  const positions = record.frustumPositions || frustumCartesians(geometry);
-  runtime.planeMaterial = new Cesium.ImageMaterialProperty({
-    image: (mode === 'video' && runtime.video) ? runtime.video : canvas,
-    transparent: true,
-    color: Cesium.Color.WHITE.withAlpha(0.95),
-  });
-  createProjectionPlane(record, runtime, geometry, positions);
-
-  return runtime;
-}
-
-/**
- * Lazily initializes the projection runtime for a record if it doesn't exist yet.
- * @param {Object} record - Camera record.
- * @returns {Object|null} The record's projection runtime.
- */
-function ensureProjectionRuntime(record) {
-  if (!record) return null;
-  if (record.projection) return record.projection;
-  const runtime = createProjectionRuntime(record);
-  record.projection = runtime;
-  if (runtime) {
-    _projectionEntities.push(runtime);
-  }
-  return runtime;
-}
-
-/**
- * Tears down a projection runtime: stops video playback, removes the monitor
- * plane, and clears its host label if it owns the active source.
- * @param {Object} runtime - Projection runtime to destroy.
- */
-function destroyProjectionRuntime(runtime) {
-  if (!runtime) return;
-  if (runtime.video) {
-    runtime.video.pause();
-    runtime.video.removeAttribute('src');
-    runtime.video.load();
-  }
-  if (runtime.planeEntity && _viewer) {
-    _viewer.entities.remove(runtime.planeEntity);
-    runtime.planeEntity = null;
-  }
-  if (_projectionOverlayOwnerId === runtime.cameraId) clearProjectionOverlay();
-  runtime.overlayEntry = null;
-  runtime.labelPosition = null;
-  runtime.planeMaterial = null;
-}
-
-/**
- * Triggers a new frame fetch for an image-mode projection if the refresh
- * interval has elapsed. Active cameras refresh more frequently than idle ones.
- * @param {Object} record - Camera record.
- * @param {boolean} [force=false] - Bypass the interval check.
- */
-function refreshProjectionImage(record, force = false) {
-  const runtime = record?.projection;
-  if (!runtime || runtime.mode !== 'image' || !runtime.image) return;
-  // Hidden-state gate (perf wave 2): no new frame fetch/decode for a canvas
-  // nobody can see. The refresh interval re-fills naturally on return.
-  if (typeof document !== 'undefined' && document.hidden && !force) return;
-  // Do not replace an in-flight URL on the 10-second refresh boundary. Slow
-  // providers otherwise leave cancelled server requests behind and the plane
-  // can remain permanently pending. The proxy bounds each attempt; load/error
-  // clears this latch so the next normal tick can refresh.
-  if (runtime.imageLoading) return;
-  const now = Date.now();
-  const refreshMs = record.camera.id === _activeCameraId
-    ? PROJECTION_ACTIVE_REFRESH_MS
-    : PROJECTION_IDLE_REFRESH_MS;
-  if (!force && now - runtime.lastImageRefreshAt < refreshMs) return;
-  runtime.lastImageRefreshAt = now;
-
-  const frameUrl = frameUrlFor(record.camera, refreshMs);
-  const sep = frameUrl.includes('?') ? '&' : '?';
-  runtime.imageLoading = true;
-  runtime.imageReady = false;
-  runtime.image.src = `${frameUrl}${sep}projTs=${Math.floor(now / refreshMs)}`;
-}
-
-/**
- * Repaints the projection placeholder at most once per PLACEHOLDER_REPAINT_MS.
- * The projection loop runs at RAF cadence — unthrottled, a pending feed would
- * re-fill the 1080p canvas (gradient + text) on every single frame.
- * @param {Object} record - Camera record.
- * @param {Object} runtime - Projection runtime.
- * @param {Object|null} health - Health state for status text.
- */
-function paintPlaceholderThrottled(record, runtime, health) {
-  const now = Date.now();
-  if (now - safeNumber(runtime.lastPlaceholderPaintAt, 0) < PLACEHOLDER_REPAINT_MS) return;
-  runtime.lastPlaceholderPaintAt = now;
-  runtime.drawnImageStamp = -1;
-  // The placeholder overwrites the canvas, so the last real frame is no longer
-  // on it. Drop the signature or an identical frame returning after an outage
-  // would be skipped as "unchanged" and leave the placeholder on the plane.
-  runtime.lastFrameSignature = null;
-  runtime.canvasStamp = (runtime.canvasStamp || 0) + 1;
-  paintProjectionPlaceholder(runtime.ctx, record.camera, health);
-}
-
-/**
- * Draws the current frame (video or image) onto the projection canvas.
- * Falls back to the placeholder if the media source is not yet ready.
- * Image feeds only repaint when a NEW image finished loading (stamp check):
- * re-blitting an unchanged 1080p image every RAF tick is pure waste since
- * texture uploads are already throttled to 1Hz buffer swaps.
- * @param {Object} record - Camera record with an initialized projection runtime.
- */
-function drawProjectionFrame(record) {
-  const runtime = record?.projection;
-  if (!runtime || !runtime.ctx) return;
-
-  const health = _healthById.get(record.camera.id) || null;
-
-  if (runtime.mode === 'video' && runtime.video) {
-    const video = runtime.video;
-    if (video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
-      runtime.ctx.clearRect(0, 0, PROJECTION_CANVAS_WIDTH, PROJECTION_CANVAS_HEIGHT);
-      runtime.ctx.drawImage(video, 0, 0, PROJECTION_CANVAS_WIDTH, PROJECTION_CANVAS_HEIGHT);
-      runtime.canvasStamp = (runtime.canvasStamp || 0) + 1;
-      return;
-    }
-    paintPlaceholderThrottled(record, runtime, health);
-    return;
-  }
-
-  refreshProjectionImage(record);
-  if (runtime.image && runtime.imageReady) {
-    if (runtime.drawnImageStamp !== runtime.imageStamp) {
-      // The frame URL carries a 10s cache-buster tick, so a fresh Image
-      // DECODES every PROJECTION_ACTIVE_REFRESH_MS whether or not the provider
-      // actually published a new picture — measured 2026-07-30: a London
-      // camera republished once in 5 minutes, an Austin one not at all.
-      // Redrawing regardless bumped canvasStamp, which forced a buffer swap
-      // and a fresh 1920x1080 texture upload; the plane renders its white
-      // base color (planeMaterial color = WHITE, alpha .95) for the frame or
-      // two Cesium needs to rebind, which IS the periodic white flash from the
-      // owner field tests (2026-07-04 and 2026-07-30).
-      const signature = projectionFrameSignature(runtime);
-      runtime.drawnImageStamp = runtime.imageStamp;
-      if (signature !== null && signature === runtime.lastFrameSignature) {
-        // Identical pixels — leave the canvas, and therefore the bound
-        // texture, completely alone. No canvasStamp bump, no swap, no flash.
-        return;
-      }
-      runtime.lastFrameSignature = signature;
-      runtime.ctx.clearRect(0, 0, PROJECTION_CANVAS_WIDTH, PROJECTION_CANVAS_HEIGHT);
-      runtime.ctx.drawImage(runtime.image, 0, 0, PROJECTION_CANVAS_WIDTH, PROJECTION_CANVAS_HEIGHT);
-      runtime.canvasStamp = (runtime.canvasStamp || 0) + 1;
-      runtime.lastPlaceholderPaintAt = 0;
-    }
-    return;
-  }
-  // A refresh is in flight (imageReady=false): keep the last good frame on
-  // the canvas instead of flashing the placeholder. Placeholder only paints
-  // when nothing has ever been drawn for this camera.
-  if (runtime.drawnImageStamp === -1) {
-    paintPlaceholderThrottled(record, runtime, health);
-  }
-}
-
-/**
- * Starts the requestAnimationFrame loop that drives projection canvas updates
- * (frame draw + texture swap) for the active camera.
- */
-/**
- * The projection rAF has real work only while a camera is actively projected
- * or a focus fade is in flight — otherwise it burned a wakeup + style poll
- * every rendered frame for the whole enabled lifetime of the layer. The tick
- * self-stops when idle; every state edge that creates work re-arms it
- * (enable, setActiveCamera, showProjection, focus-target appearance).
- * (perf wave 1)
- * @returns {boolean} Whether the loop currently has work.
- */
-function projectionLoopIsNeeded() {
-  if (!_enabled || !_viewer) return false;
-  if (_showProjection && getActiveRecord()) return true;
-  return focusPassIsNeeded(getFocusTarget(), _activeFocusStyleCount);
-}
-
-function startProjectionLoop() {
-  if (_projectionRaf) return;
-  if (!projectionLoopIsNeeded()) return;
-  // The armed projection loop uploads video textures / runs focus fades per
-  // frame — the scene must render continuously while it runs. Released when
-  // the tick self-stops. (perf wave 2)
-  holdContinuousRender('cctv-projection');
-
-  const tick = () => {
-    if (!_viewer || !projectionLoopIsNeeded()) {
-      _projectionRaf = 0;
-      releaseContinuousRender('cctv-projection');
-      return;
-    }
-
-    refreshCctvFocusStyles(performance.now());
-
-    const active = getActiveRecord();
-    if (_enabled && _showProjection && active) {
-      ensureProjectionRuntime(active);
-      if (active.projection?.video) {
-        active.projection.video.play().catch(() => {});
-      }
-      if (active.projection) {
-        drawProjectionFrame(active);
-        refreshProjectionTextures(active);
-      }
-    }
-
-    _projectionRaf = requestAnimationFrame(tick);
-  };
-
-  _projectionRaf = requestAnimationFrame(tick);
 }
 
 /**
@@ -2042,60 +1082,6 @@ export function applyCctvFocusDeemphasis({
   return { writes, transitioning, activeCount, ran: true };
 }
 
-/** Cancels the projection animation loop. */
-function stopProjectionLoop() {
-  if (_projectionRaf) {
-    cancelAnimationFrame(_projectionRaf);
-    _projectionRaf = 0;
-  }
-  releaseContinuousRender('cctv-projection');
-}
-
-/**
- * Recomputes the pure frustum geometry from the camera pose + the given ground
- * altitude and writes it into the scene: billboard position, the 5 wireframe
- * polylines (4 corner rays + closed far-plane rectangle), and the monitor
- * plane placement. This is the ONLY place v2 geometry is written — called on
- * slider input / save / activation / the one-shot ground snap, never per frame.
- * @param {Object} record - Camera record.
- * @param {number} groundAltM - Ground altitude at the mount (metres).
- */
-function applyFrustumGeometry(record, groundAltM) {
-  const geometry = computeFrustumGeometry(record.camera, groundAltM, record.probeClampRangeM);
-  const positions = frustumCartesians(geometry);
-  record.frustumGeometry = geometry;
-  record.frustumPositions = positions;
-  record.position = positions.mount;
-  record.camera.absoluteHeightM = geometry.mount.alt;
-  if (record.billboard) {
-    record.billboard.position = positions.mount;
-  }
-  if (record.coverageEntities?.length >= 5) {
-    record.coverageEntities[0].polyline.positions = [positions.mount, positions.tl];
-    record.coverageEntities[1].polyline.positions = [positions.mount, positions.tr];
-    record.coverageEntities[2].polyline.positions = [positions.mount, positions.br];
-    record.coverageEntities[3].polyline.positions = [positions.mount, positions.bl];
-    record.coverageEntities[4].polyline.positions = [
-      positions.tl, positions.tr, positions.br, positions.bl, positions.tl,
-    ];
-  }
-  // A live viewshed volume tracks its wireframe: rebuild from the SAME fresh
-  // positions (weld invariant). Only records currently showing a volume pay
-  // this (6 triangles, synchronous — trivial even during slider/gizmo drags).
-  // Tint derives from the live active id, not the cached viewshedActiveTint —
-  // during an activation switch this runs BEFORE refreshCoverageStyles, and
-  // the cache is stale for exactly that window.
-  if (record.viewshedPrimitive) {
-    rebuildViewshedVolume(record, record.camera.id === _activeCameraId);
-  }
-  updatePlanePlacement(record);
-  // Gizmo handles track the pose they manipulate: refresh when the ACTIVE
-  // camera's geometry rewrites (incl. during its own drag).
-  if (_gizmo?.isEnabled() && record.camera.id === _activeCameraId) {
-    _gizmo.refresh();
-  }
-}
-
 /**
  * Refreshes a record's frustum geometry with a regime-aware, ONE-SHOT ground
  * resolution (Task 5, spec §2). Per regime:
@@ -2118,6 +1104,79 @@ function applyFrustumGeometry(record, groundAltM) {
  * @param {boolean} [options.sampleGround=true] - When false, skip shared
  *   mesh-floor refinement and use the cached/prior ground instead.
  */
+function photorealTilesReady() {
+  const scene = _viewer?.scene;
+  const primitives = scene?.primitives;
+  if (!primitives) return false;
+  for (let i = 0; i < primitives.length; i += 1) {
+    const primitive = primitives.get(i);
+    if (primitive instanceof Cesium.Cesium3DTileset && primitive.show && primitive.ready) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function applyCameraPlacement(record, groundAltM) {
+  const camera = record.camera;
+  const ground = safeNumber(groundAltM, 0);
+  // Calibration offsets (dN/dE/height) are already folded into camera.lat/lon/
+  // mountHeightM by applyCalibrationPatch, so placement is a direct read.
+  const mountAlt = ground + safeNumber(camera.mountHeightM, 24);
+  const mount = Cesium.Cartesian3.fromDegrees(camera.lon, camera.lat, mountAlt);
+  record.position = mount;
+  camera.absoluteHeightM = mountAlt;
+  if (record.billboard) record.billboard.position = mount;
+  updateOrientationArrow(record, mount, mountAlt);
+}
+
+/**
+ * Points the camera's orientation arrow along its effective heading.
+ *
+ * A fixed ground length, not a projected range: the arrow states WHICH WAY the
+ * camera looks and deliberately claims nothing about how far it sees. The old
+ * frustum encoded range and FOV, and every one of those numbers was a RAW
+ * PRIOR — drawing them implied a precision the source never provided.
+ *
+ * @param {object} record
+ * @param {Cesium.Cartesian3} mount
+ * @param {number} mountAlt
+ * @returns {void}
+ */
+function updateOrientationArrow(record, mount, mountAlt) {
+  if (!record.arrow) return;
+  const heading = safeNumber(record.camera.headingDeg, 0);
+  const tip = projectPoint(record.camera.lat, record.camera.lon, heading, ORIENTATION_ARROW_LENGTH_M);
+  record.arrow.positions = [mount, Cesium.Cartesian3.fromDegrees(tip.lon, tip.lat, mountAlt)];
+}
+
+/**
+ * Styles icons and arrows for the current active camera. Replaces the v2/v3
+ * coverage style pass: with no frustum, plane or viewshed there is nothing
+ * left to style but the two surfaces that remain.
+ *
+ * @returns {void}
+ */
+function refreshCameraStyles() {
+  const activeId = getActiveRecord()?.camera.id || null;
+  for (const record of _records) {
+    const isActive = record.camera.id === activeId;
+    if (record.billboard) {
+      record.billboard.color = isActive ? ACTIVE_CAMERA_COLOR : IDLE_CAMERA_COLOR;
+      record.billboard.scale = isActive ? 1.25 : 1.0;
+      // disableDepthTestDistance stays POSITIVE_INFINITY for every billboard
+      // (set at creation) — see the field-test far-zoom submerge fix there.
+    }
+    if (record.arrow) {
+      record.arrow.width = isActive ? ARROW_WIDTH_ACTIVE : ARROW_WIDTH_IDLE;
+      record.arrow.material = isActive ? _arrowMaterialActive : _arrowMaterialIdle;
+    }
+  }
+  if (_billboards) _billboards.show = !!_enabled;
+  if (_arrows) _arrows.show = !!_enabled;
+  governorRequestRender();
+}
+
 function updateRecordGeometry(record, options = {}) {
   const sampleGround = options.sampleGround !== false;
   const regime = currentSurfaceRegime();
@@ -2129,19 +1188,18 @@ function updateRecordGeometry(record, options = {}) {
     const ground = Number.isFinite(cachedFloor) ? cachedFloor : groundPriorAltFor(record);
     record.groundSamples['terrain-globe'] = ground;
     record.groundResolved['terrain-globe'] = true;
-    applyFrustumGeometry(record, ground);
+    applyCameraPlacement(record, ground);
     return;
   }
 
   // Photoreal regime. Sampling is delegated to the shared coarse-cell
   // sampler. It remains event-driven, one-shot per cell, and keeps its
   // existing acceptance window; CCTV adds no rooftop rejection policy.
-  if (sampleGround && projectionTilesReady()) {
+  if (sampleGround && photorealTilesReady()) {
     record.groundMeshSampleRequestCount = (record.groundMeshSampleRequestCount || 0) + 1;
     const viewerCarto = _viewer?.camera?.positionCartographic;
-    const excludeObjects = [...(record.coverageEntities || [])];
+    const excludeObjects = [];
     if (record.billboard) excludeObjects.push(record.billboard);
-    if (record.projection?.planeEntity) excludeObjects.push(record.projection.planeEntity);
     sampleMeshFloorCells(_viewer?.scene, [point], {
       excludeObjects: excludeObjects.filter(Boolean),
       viewerLat: viewerCarto ? Cesium.Math.toDegrees(viewerCarto.latitude) : undefined,
@@ -2153,7 +1211,7 @@ function updateRecordGeometry(record, options = {}) {
   const ground = Number.isFinite(cachedFloor)
     ? cachedFloor
     : groundAltFor(record, 'google-3d');
-  applyFrustumGeometry(record, ground);
+  applyCameraPlacement(record, ground);
 
   record.groundResolved['google-3d'] = Number.isFinite(cachedFloor);
   if (Number.isFinite(cachedFloor)) {
@@ -2207,7 +1265,7 @@ function resolveCommittedGroundAnchor(record) {
     if (record.camera.lat !== point.lat || record.camera.lon !== point.lon) return;
     rearmGroundResolution(record);
     updateRecordGeometry(record);
-    refreshCoverageStyles();
+    refreshCameraStyles();
     notifyListeners();
   });
 }
@@ -2278,7 +1336,7 @@ function applyLateGroundPriors(records, priors) {
     } else if (!Number.isFinite(record.groundSamples['google-3d'])) {
       // Still awaiting the shared floor: snap interim geometry onto the exact
       // prior (pure recompute; the shared cell may refine later).
-      applyFrustumGeometry(record, prior.ellipsoid);
+      applyCameraPlacement(record, prior.ellipsoid);
       applied += 1;
     }
   }
@@ -2318,7 +1376,7 @@ function handleMapStackChanged() {
     if (record.frustumGeometry && Math.abs(record.frustumGeometry.groundAltM - ground) < 0.001) {
       continue;
     }
-    applyFrustumGeometry(record, ground);
+    applyCameraPlacement(record, ground);
   }
 
   if (regime === 'google-3d') {
@@ -2527,11 +1585,10 @@ export function processGeometryBatch() {
       if (wasInitialLoad) {
         _geoLoadDone = _geoLoadTotal;
         if (_enabled) {
-          refreshCoverageStyles();
+          refreshCameraStyles();
           // Geometry refinement may have replaced record.position objects — the
           // one-shot drain completion re-anchors the card entries (event-driven,
           // not a per-frame or timer pass).
-          refreshAmbientCards();
         }
       }
       // Completion is never coalesced: subscribers must observe the final
@@ -2618,93 +1675,6 @@ function getActiveRecord() {
 }
 
 /**
- * Pauses video playback on all non-active camera projections and resumes
- * the active one (if projection is enabled).
- * @param {string|null} activeId - ID of the currently active camera.
- */
-function pauseInactiveProjectionFeeds(activeId) {
-  for (const record of _records) {
-    if (!record.projection?.video) continue;
-    if (record.camera.id === activeId && _enabled && _showProjection) {
-      record.projection.video.play().catch(() => {});
-    } else {
-      record.projection.video.pause();
-    }
-  }
-}
-
-/**
- * Determines which camera coverage overlays should be visible based on
- * proximity to the active camera. Limits visibility to
- * COVERAGE_NEIGHBOR_LIMIT cameras within COVERAGE_NEIGHBOR_RADIUS_KM.
- * @param {Object|null} activeRecord - The active camera record.
- * @returns {Set<string>} Set of visible camera IDs.
- */
-function buildCoverageVisibleSet(activeRecord) {
-  if (!_records.length) return new Set();
-  // Coverage emphasis is relative to a selected camera. Without one, do not
-  // invent an arbitrary catalog-order cohort.
-  if (!activeRecord) return new Set();
-
-  const ranked = _records.map((record) => {
-    if (record === activeRecord) {
-      return { record, distKm: -1 };
-    }
-    return {
-      record,
-      distKm: haversineKm(
-        activeRecord.camera.lat,
-        activeRecord.camera.lon,
-        record.camera.lat,
-        record.camera.lon
-      ),
-    };
-  });
-
-  ranked.sort((a, b) => a.distKm - b.distKm);
-
-  const primary = ranked.filter((entry) => entry.distKm <= COVERAGE_NEIGHBOR_RADIUS_KM || entry.distKm === -1);
-  const fallback = ranked;
-  const chosen = (primary.length >= COVERAGE_NEIGHBOR_LIMIT ? primary : fallback)
-    .slice(0, COVERAGE_NEIGHBOR_LIMIT)
-    .map((entry) => entry.record.camera.id);
-  return new Set(chosen);
-}
-
-/**
- * Removes (and destroys) a record's viewshed volume primitive, if any.
- * @param {Object} record - Camera record.
- */
-function destroyViewshedVolume(record) {
-  if (!record) return;
-  if (record.viewshedPrimitive && _viewer) {
-    _viewer.scene.primitives.remove(record.viewshedPrimitive);
-  }
-  record.viewshedPrimitive = null;
-}
-
-/**
- * (Re)builds a record's translucent viewshed volume from its CURRENT
- * frustumPositions — the same 5 Cartesians the wireframe draws, so the volume
- * is welded to the cone by construction. Called only where the wireframe
- * already rewrites (style refresh on mode/visible-set/active changes,
- * applyFrustumGeometry on pose edits) — no new update cadence, zero scene
- * queries (viewshed design §3b).
- * @param {Object} record - Camera record.
- * @param {boolean} isActive - Active camera gets the brighter fill.
- */
-function rebuildViewshedVolume(record, isActive) {
-  destroyViewshedVolume(record);
-  if (!_viewer || !record?.frustumPositions || !record.viewshedColors) return;
-  const color = isActive ? record.viewshedColors.fillActive : record.viewshedColors.fill;
-  const primitive = createFrustumVolumePrimitive(record.frustumPositions, color);
-  // QA tag: the harness counts viewshed volumes by this marker.
-  primitive._gevViewshed = record.camera.id;
-  record.viewshedPrimitive = _viewer.scene.primitives.add(primitive);
-  record.viewshedActiveTint = !!isActive;
-}
-
-/**
  * Updates visual styles (colors, widths, visibility) for all camera billboards,
  * coverage polylines, viewshed volumes, and projection entities based on which
  * camera is active, whether the layer is enabled, and the current
@@ -2735,564 +1705,10 @@ function refreshHorizonCulling() {
 // docs/superpowers/specs/2026-07-29-cctv-ambient-cards-design.md)
 // ---------------------------------------------------------------------------
 
-/** Returns (creating on demand) the stable frame slot for a camera id. */
-function ensureCardFrameSlot(cameraId) {
-  let slot = _cardFrameSlots.get(cameraId);
-  if (!slot) {
-    slot = createFrameSlot();
-    _cardFrameSlots.set(cameraId, slot);
-  }
-  return slot;
-}
-
-/**
- * Rebuilds the ambient card selection: horizon + in-view projection of the
- * catalog (pure math — no scene queries), the zoom-budgeted nearest-first
- * LOD pick, greedy screen-space declutter, and the eviction-grace pass that
- * keeps budget-edge cards alive across small camera moves (zero-flicker).
- * Runs on camera.moveEnd, enable, activation change, and the one-shot
- * geometry-drain completion — NEVER per frame. The active camera is excluded
- * from the ambient selection/quota. By default its monitor plane is the sole
- * active representation; the optional protected-card path is applied only by
- * `pushAmbientCardEntries`. Camera icons are never touched here (cards
- * annotate markers, they don't replace them).
- */
-function refreshAmbientCards() {
-  if (!_enabled || !_viewer || _viewer.isDestroyed() || !_records.length) {
-    _cctvOverlayHost.setEntries(CCTV_OVERLAY_SOURCE_ID, [], CCTV_OVERLAY_SOURCE_OPTIONS);
-    return;
-  }
-  const scene = _viewer.scene;
-  const carto = _viewer.camera.positionCartographic;
-  const viewerLat = carto ? Cesium.Math.toDegrees(carto.latitude) : 0;
-  const viewerLon = carto ? Cesium.Math.toDegrees(carto.longitude) : 0;
-  // The active camera is excluded from ambient selection ALWAYS (not just
-  // after its async activation settles). It is published separately in the
-  // protected lane below, and grace never applies to it.
-  const activeId = _activeCameraId;
-  const occluder = horizonOccluder(_viewer.camera);
-  const width = scene.canvas.clientWidth || scene.canvas.width || 0;
-  const height = scene.canvas.clientHeight || scene.canvas.height || 0;
-  const marginX = width * CARD_VIEW_MARGIN;
-  const marginY = height * CARD_VIEW_MARGIN;
-
-  const candidates = [];
-  const screenById = new Map();
-  for (const record of _records) {
-    const id = record.camera.id;
-    if (id === activeId || !record.position) continue;
-    let inView = false;
-    let sx = NaN;
-    let sy = NaN;
-    if (occluder.isPointVisible(record.position)) {
-      const screen = scene.cartesianToCanvasCoordinates(record.position);
-      if (screen && Number.isFinite(screen.x) && Number.isFinite(screen.y)
-        && screen.x >= -marginX && screen.x <= width + marginX
-        && screen.y >= -marginY && screen.y <= height + marginY) {
-        inView = true;
-        sx = screen.x;
-        sy = screen.y;
-        screenById.set(id, { sx, sy });
-      }
-    }
-    candidates.push({
-      id,
-      distanceKm: haversineKm(viewerLat, viewerLon, record.camera.lat, record.camera.lon),
-      inView,
-      isVideo: isVideoFeedType(normalizeFeedType(record.camera.feedType)),
-      sx,
-      sy,
-    });
-  }
-
-  // Owner finding 4: current card holders rank with the 20% incumbency
-  // distance discount, so a small camera move never batch-swaps the ring.
-  // Item C: passing the viewport dims + per-candidate screen anchors routes
-  // the budget fill through the screen-distribution grid, so periphery
-  // cells hold cards instead of everything clustering at screen center.
-  const { cardIds, budgets } = selectCctvLod(candidates, {
-    cameraHeightM: carto?.height,
-    incumbentIds: _cardIds,
-    viewW: width,
-    viewH: height,
-  });
-  // Like the cold-fill burst, card density yields to the staggered geometry
-  // drain: painting the raised 20/28/40 budget per frame starves the
-  // frame-paced mesh-floor queue on weak GPUs (qa-cctv-v2 N=800 drain-budget
-  // regression). During the initial load the budget holds at the low tier;
-  // full density arrives the moment the drain completes (which triggers its
-  // own refreshAmbientCards pass).
-  const cardLimit = _geoLoading
-    ? Math.min(budgets.cardLimit, CCTV_AMBIENT_CARD_DRAIN_CAP)
-    : budgets.cardLimit;
-  const decluttered = declutterCctvCards(
-    cardIds
-      .filter((id) => screenById.has(id))
-      .slice(0, cardLimit)
-      .map((id, index) => ({
-        id,
-        ...screenById.get(id),
-        // Priority carrier, not kilometers: declutter sorts ascending on
-        // this field, and the selection's order (distribution + incumbency)
-        // must survive — a periphery cell-winner must not be re-outranked
-        // by central proximity when two anchors contest the min separation.
-        distanceKm: index,
-      })),
-    { limit: cardLimit }
-  );
-  // Owner finding 2: grace must never apply to the active camera — drop any
-  // lingering grace entry and keep it out of the retained-card baseline.
-  if (activeId) {
-    _cardIds.delete(activeId);
-    _cardGraceState.delete(activeId);
-  }
-  const retention = applyEvictionGrace({
-    selectedIds: decluttered,
-    builtIds: [..._cardIds],
-    graceState: _cardGraceState,
-    nowMs: Date.now(),
-    cardLimit: budgets.cardLimit,
-  });
-  _cardIds = new Set(retention.keepIds);
-  _cardGraceState = retention.graceState;
-
-  // Bounded thumbnail LRU: live cards (grace included) never lose their
-  // persisted frame — that persistence IS the no-flicker guarantee. The
-  // hover card's slot is protected too while the gesture lasts.
-  const keepFrames = new Set(_cardIds);
-  if (_hoverCardId) keepFrames.add(_hoverCardId);
-  if (_activeCameraCardEnabled && _activeCameraId) keepFrames.add(_activeCameraId);
-  const drops = planFrameCachePrune(
-    [..._cardFrameSlots].map(([id, slot]) => ({ id, stamp: slot.stamp })),
-    keepFrames
-  );
-  for (const id of drops) _cardFrameSlots.delete(id);
-
-  pushAmbientCardEntries();
-}
-
-/**
- * Builds and publishes the card entry list from the current kept set and the
- * hover-summoned pin. The hover entry is budget-exempt and high-priority. The
- * active camera is absent by default; `activeCameraCardEnabled` retains the
- * migrated protected-publication path as an explicit product option. If the
- * LOD selection adopts the hovered camera it remains a normal budgeted entry
- * that keeps the pin while the gesture lasts.
- */
-function pushAmbientCardEntries() {
-  const entries = [];
-  let rank = 0;
-  const push = (id, { pinned = false, active = false } = {}) => {
-    const record = _recordById.get(id);
-    if (!record?.position) return;
-    entries.push(createCctvThumbnailOverlayEntry({
-      id,
-      position: record.position,
-      gapPx: CARD_GAP_PX,
-      title: record.camera.name,
-      frameSlot: ensureCardFrameSlot(id),
-      rank: rank++,
-      pinned,
-      active,
-    }));
-  };
-  for (const id of _cardIds) push(id, { pinned: id === _hoverCardId });
-  if (_hoverCardId && !_cardIds.has(_hoverCardId) && _hoverCardId !== _activeCameraId) {
-    push(_hoverCardId, { pinned: true });
-  }
-  if (_activeCameraCardEnabled && _activeCameraId) {
-    push(_activeCameraId, { active: true });
-  }
-  _cctvOverlayHost.setEntries(
-    CCTV_OVERLAY_SOURCE_ID,
-    entries,
-    CCTV_OVERLAY_SOURCE_OPTIONS,
-  );
-}
-
-/**
- * Throttled MOUSE_MOVE hover pass (owner round 2, item B): pointing at a
- * camera icon that has no card summons its card immediately. This is
- * EVENT-DRIVEN picking on a user gesture, not steady-state work — the
- * ≥120 ms throttle caps it at ~8 scene.pick calls/s while the pointer is
- * actually moving (a still pointer costs nothing), so it can never approach
- * per-frame cost. Skipped while the camera is in motion, while ADJUST mode
- * owns the pointer (gizmo drags), and while the layer is disabled.
- * @param {Cesium.Cartesian2} position - Pointer position (CSS px).
- */
-function handleHoverMove(position) {
-  if (!_enabled || _cameraMoving || _calibrationMode || !position) return;
-  if (!_viewer || _viewer.isDestroyed()) return;
-  const now = Date.now();
-  if (now - _hoverLastPickAt < HOVER_PICK_THROTTLE_MS) return;
-  _hoverLastPickAt = now;
-  let picked = null;
-  try {
-    picked = _viewer.scene.pick(position);
-  } catch {
-    picked = null;
-  }
-  const cameraId = extractPickedCameraId(picked);
-  if (cameraId && cameraId === _hoverCardId) {
-    // Still on the hovered camera — keep the card alive.
-    cancelHoverRelease();
-    return;
-  }
-  const record = cameraId ? _recordById.get(cameraId) : null;
-  // Hovering the active camera or a camera that already has a card is a
-  // no-op; video feeds stay icon-only until activated (ambient tier is
-  // stills-only — same rule as the LOD selection).
-  const eligible = !!record
-    && cameraId !== _activeCameraId
-    && !_cardIds.has(cameraId)
-    && !isVideoFeedType(normalizeFeedType(record.camera.feedType));
-  if (eligible) {
-    cancelHoverRelease();
-    _hoverCardId = cameraId;
-    // Immediacy: the pinned entry publishes now — chrome may paint before
-    // the first frame arrives (documented exception in cctvCards.js).
-    pushAmbientCardEntries();
-    hoverFetchCardFrame(record);
-  } else if (_hoverCardId) {
-    // Pointer left the hovered icon: linger ~1 s, then release.
-    scheduleHoverRelease();
-  }
-}
-
-/** Cancels a pending hover-card release. */
-function cancelHoverRelease() {
-  if (_hoverReleaseTimer) {
-    clearTimeout(_hoverReleaseTimer);
-    _hoverReleaseTimer = 0;
-  }
-}
-
-/**
- * Schedules the hover card's release ~1 s after unhover. On release the pin
- * drops; the card stays only if the LOD selection has adopted the camera
- * (it is then a normal budgeted entry in `_cardIds`).
- */
-function scheduleHoverRelease() {
-  if (_hoverReleaseTimer) return;
-  _hoverReleaseTimer = setTimeout(() => {
-    _hoverReleaseTimer = 0;
-    _hoverCardId = null;
-    pushAmbientCardEntries();
-  }, HOVER_RELEASE_MS);
-}
-
-/** Clears the hover-card state (teardown / activation of the hovered camera). */
-function clearHoverCard() {
-  cancelHoverRelease();
-  _hoverCardId = null;
-  _hoverLastPickAt = 0;
-}
-
-/**
- * Fast-tracked frame fetch for the hover-summoned card: launches
- * immediately, bypassing the pacer's launch-spacing gate (a single
- * user-gesture fetch is fine even during the geometry drain), but still
- * respecting the per-camera failure backoff / freshness check
- * (frameFetchDue), the no-double-fetch pending set, and the burst in-flight
- * cap of 4.
- * @param {Object} record - The hovered camera's record.
- */
-function hoverFetchCardFrame(record) {
-  const cameraId = record.camera.id;
-  if (_cardFetchPendingIds.has(cameraId)) return;
-  if (_cardFetchInFlightCount >= CCTV_CARD_FETCH_BURST_LIMIT) return;
-  const slot = ensureCardFrameSlot(cameraId);
-  const refreshMs = staticFrameRefreshMs(record.camera);
-  if (!frameFetchDue(slot, refreshMs, Date.now())) return;
-  fetchCardFrame(record, slot, refreshMs, { userGesture: true });
-}
-
-/**
- * Card-frame pacer tick (owner finding 3): launches AT MOST one fetch per
- * tick, with cardFetchPolicy deciding whether a launch is allowed. Cold fill
- * — any selected card still missing its FIRST frame — bursts up to 4
- * in-flight fetches at 250 ms spacing so arriving in a new area populates
- * in a few seconds instead of 16-32 s; once every selected card has a first
- * frame the layer drops back to the salvaged steady-state gate (single
- * flight, one request per second). Priority: frameless cards first in ring
- * order (nearest-first — they're what makes a card appear at all), then the
- * stalest refresh-overdue card by its source cadence (staticFrameRefreshMs).
- * Failures back off per camera (frameFetchDue) instead of hammering a dead
- * source, so a dead upstream never eats the burst slots.
- */
-function cardFrameTick() {
-  if (!_enabled || (!_cardIds.size && !(_activeCameraCardEnabled && _activeCameraId))) return;
-  const now = Date.now();
-  let frameless = null;
-  let stalest = null;
-  let coldFill = false;
-  const consider = (id) => {
-    const record = _recordById.get(id);
-    if (!record) return;
-    const slot = ensureCardFrameSlot(id);
-    if (_cardFetchPendingIds.has(id)) {
-      // An in-flight first-frame fetch keeps cold-fill mode active without
-      // being re-launchable.
-      if (!(slot.stamp > 0)) coldFill = true;
-      return;
-    }
-    const refreshMs = staticFrameRefreshMs(record.camera);
-    if (!frameFetchDue(slot, refreshMs, now)) return;
-    if (!(slot.stamp > 0)) {
-      coldFill = true;
-      if (!frameless) frameless = { record, slot, refreshMs };
-      return;
-    }
-    if (!stalest || slot.stamp < stalest.slot.stamp) {
-      stalest = { record, slot, refreshMs };
-    }
-  };
-  // The optional protected active card stays outside the 40-card ambient
-  // quota and uses the same source-owned pacing/retry/cache lifecycle.
-  if (_activeCameraCardEnabled && _activeCameraId) consider(_activeCameraId);
-  for (const id of _cardIds) consider(id);
-  const policy = cardFetchPolicy({
-    // The cold-fill burst yields to the staggered geometry drain: 4 concurrent
-    // image fetch+decodes mid-drain starve the mesh-floor queue on weak GPUs
-    // (qa-cctv-v2 drain-budget regression). Steady 1/s trickle still runs;
-    // the burst fires the moment the drain completes.
-    coldFill: coldFill && !_geoLoading,
-    inFlight: _cardFetchInFlightCount,
-    sinceLastLaunchMs: _cardLastFetchAt > 0 ? now - _cardLastFetchAt : Infinity,
-  });
-  _cardFetchMode = policy.mode;
-  if (!policy.launch) return;
-  const pick = frameless || stalest;
-  if (pick) fetchCardFrame(pick.record, pick.slot, pick.refreshMs);
-}
-
-/**
- * Fetches one paced static frame and settles it into the stable slot via the
- * pure persistence rule (applyFrameResult): success replaces the thumbnail,
- * failure leaves the drawn frame untouched. The frame is downscaled once
- * into a 2x-thumb offscreen canvas; the renderer reads the slot live.
- * @param {Object} record - Camera record.
- * @param {Object} slot - The camera's stable frame slot.
- * @param {number} refreshMs - Source cadence (also keys the frame-URL tick).
- * @param {Object} [options]
- * @param {boolean} [options.userGesture] - Hover fast-track (item B): the
- *   launch bypasses the pacer gate, so its spacing sample would pollute the
- *   pacing telemetry — skip the min-spacing sample only. The launch still
- *   stamps `_cardLastFetchAt`, so the pacer waits a full interval after it.
- */
-function fetchCardFrame(record, slot, refreshMs, { userGesture = false } = {}) {
-  if (typeof document !== 'undefined' && document.hidden && !userGesture) return;
-  const now = Date.now();
-  const cameraId = record.camera.id;
-  _cardFetchInFlightCount += 1;
-  _cardFetchPendingIds.add(cameraId);
-  if (_cardLastFetchAt > 0 && !userGesture) {
-    const spacing = now - _cardLastFetchAt;
-    // NOTE: cold-fill bursts legitimately push this to ~250 ms — read it
-    // together with the ambientCards.fetchMode telemetry.
-    _cardMinFetchSpacingMs = _cardMinFetchSpacingMs == null
-      ? spacing
-      : Math.min(_cardMinFetchSpacingMs, spacing);
-  }
-  _cardLastFetchAt = now;
-  _cardFetchCount += 1;
-
-  const image = new Image();
-  _cardFetchImages.add(image);
-  const settle = (ok) => {
-    image.onload = null;
-    image.onerror = null;
-    if (_cardFetchImages.delete(image)) {
-      _cardFetchInFlightCount = Math.max(0, _cardFetchInFlightCount - 1);
-      _cardFetchPendingIds.delete(cameraId);
-    }
-    let frame = null;
-    if (ok) {
-      try {
-        const canvas = document.createElement('canvas');
-        canvas.width = CCTV_FRAME_CANVAS_W;
-        canvas.height = CCTV_FRAME_CANVAS_H;
-        canvas.getContext('2d').drawImage(image, 0, 0, canvas.width, canvas.height);
-        frame = canvas;
-      } catch {
-        frame = null;
-      }
-    }
-    Object.assign(slot, applyFrameResult(slot, { ok: !!frame, frame }, Date.now()));
-    _viewer?.scene?.requestRender?.();
-  };
-  image.onload = () => settle(true);
-  image.onerror = () => settle(false);
-  image.src = frameUrlFor(record.camera, refreshMs);
-}
-
-/** Starts the card-frame pacer (idempotent; policy-gated per tick). */
-function startCardFrameLoop() {
-  if (_cardFetchTimer) return;
-  _cardFetchTimer = setInterval(cardFrameTick, CARD_FETCH_TICK_MS);
-}
-
-/**
- * Hidden-state gate (perf wave 2): detach in-flight card frame decodes when
- * the document hides — a hidden canvas has no reader, and image decode is
- * the expensive half. New fetches are gated at fetchCardFrame; the steady
- * pacer refills naturally on return. Installed once at module scope.
- */
-if (typeof document !== 'undefined') {
-  document.addEventListener('visibilitychange', () => {
-    if (!document.hidden) return;
-    for (const image of _cardFetchImages) {
-      image.onload = null;
-      image.onerror = null;
-      image.removeAttribute('src');
-    }
-    _cardFetchImages.clear();
-    _cardFetchPendingIds.clear();
-    _cardFetchInFlightCount = 0;
-  });
-}
-
-/** Stops the pacer and detaches all in-flight fetch handlers. */
-function stopCardFrameLoop() {
-  if (_cardFetchTimer) {
-    clearInterval(_cardFetchTimer);
-    _cardFetchTimer = 0;
-  }
-  for (const image of _cardFetchImages) {
-    image.onload = null;
-    image.onerror = null;
-    image.removeAttribute('src');
-  }
-  _cardFetchImages.clear();
-  _cardFetchPendingIds.clear();
-  _cardFetchInFlightCount = 0;
-  _cardFetchMode = 'steady';
-}
-
-/**
- * Complete ambient-tier teardown (layer disable/destroy): pacer + in-flight
- * handlers, shared-host source entries, card set, grace state, thumbnail
- * cache, and fetch telemetry. Nothing leaks across a toggle.
- */
-function teardownAmbientCards() {
-  stopCardFrameLoop();
-  _cctvOverlayHost.clearSource(CCTV_OVERLAY_SOURCE_ID);
-  _cctvOverlayHost.setVisible(CCTV_OVERLAY_SOURCE_ID, false);
-  clearHoverCard();
-  _cameraMoving = false;
-  _cardIds = new Set();
-  _cardGraceState = new Map();
-  _cardFrameSlots = new Map();
-  _cardFetchCount = 0;
-  _cardLastFetchAt = 0;
-  _cardMinFetchSpacingMs = null;
-}
-
-/**
- * Hides every per-record CCTV visual without recomputing coverage membership or
- * styles. Disabling makes every visibility branch false, so a direct sweep is
- * sufficient; live viewshed primitives still require explicit destruction.
- *
- * @param {Object[]} records CCTV runtime records.
- * @param {(record: Object) => void} destroyVolume Viewshed teardown callback.
- * @param {string|null} [activeCameraId=null] Active camera whose activation probe must be re-armed.
- */
-export function hideCctvRecordVisuals(records, destroyVolume, activeCameraId = null) {
-  for (const record of Array.isArray(records) ? records : []) {
-    if (record) {
-      record.probeClampRangeM = null;
-      if (record.camera?.id === activeCameraId) record.activationDone = false;
-    }
-    for (const entity of record?.coverageEntities || []) entity.show = false;
-    if (record?.viewshedPrimitive) destroyVolume?.(record);
-    if (record?.projection?.planeEntity) record.projection.planeEntity.show = false;
-  }
-}
-
 function hideCctvVisuals() {
-  hideCctvRecordVisuals(_records, destroyViewshedVolume, _activeCameraId);
-  clearProjectionOverlay();
   if (_billboards) _billboards.show = false;
-  pauseInactiveProjectionFeeds(null);
-}
-
-/** Applies coverage visibility/style state and lazily builds eligible sets. */
-export function refreshCoverageStyles() {
-  const activeRecord = getActiveRecord();
-  ensureActiveCoverageEntities(activeRecord);
-  const activeId = activeRecord?.camera.id || null;
-  const coverageVisible = buildCoverageVisibleSet(activeRecord);
-  const coverageOn = _coverageMode !== 'off';
-  const viewshedOn = _coverageMode === 'viewshed';
-  if (coverageOn) {
-    ensureVisibleCoverageEntities(_records, coverageVisible);
-  }
-  for (const record of _records) {
-    const isActive = record.camera.id === activeId;
-    if (record.billboard) {
-      record.billboard.color = isActive ? ACTIVE_CAMERA_COLOR : IDLE_CAMERA_COLOR;
-      record.billboard.scale = isActive ? 1.25 : 1.0;
-      // disableDepthTestDistance stays POSITIVE_INFINITY for every billboard
-      // (set at creation) — see the field-test far-zoom submerge fix there.
-    }
-
-    if (_enabled && _showProjection && isActive) {
-      ensureProjectionRuntime(record);
-    }
-    // One live plane in the world at a time (§2c): only the active camera's
-    // far cap carries the monitor plane; idle neighbors get the faint
-    // wireframe only.
-    const planeShowing = !!(_enabled && _showProjection && isActive);
-
-    const inVisibleSet = coverageVisible.has(record.camera.id);
-    for (const entity of record.coverageEntities || []) {
-      // The frustum wireframe is part of the projection representation —
-      // force it on for the active camera and let it read through geometry
-      // via depthFailMaterial (polylines have no disableDepthTestDistance).
-      entity.show = !!(_enabled && ((coverageOn && inVisibleSet) || planeShowing));
-      if (!entity.polyline) continue;
-      // Viewshed mode swaps the cyan/green scheme for the camera's own hue so
-      // adjacent cones read as distinct coverage claims (design §3b); the
-      // active camera keeps its width/alpha emphasis in both schemes.
-      const hue = viewshedOn ? record.viewshedColors : null;
-      if (entity._coverageRole === 'cap') {
-        entity.polyline.material = hue
-          ? (isActive ? hue.lineActive : hue.line)
-          : (isActive ? ACTIVE_COVERAGE_CENTER : IDLE_COVERAGE_CENTER_MUTED);
-        entity.polyline.width = isActive ? 2.2 : 1.0;
-        entity.polyline.depthFailMaterial = planeShowing
-          ? (hue ? hue.line.withAlpha(0.26) : ACTIVE_COVERAGE_CENTER_DEPTHFAIL)
-          : undefined;
-      } else {
-        entity.polyline.material = hue
-          ? (isActive ? hue.lineActive : hue.line.withAlpha(0.6))
-          : (isActive ? ACTIVE_COVERAGE_EDGE : IDLE_COVERAGE_EDGE_MUTED);
-        entity.polyline.width = isActive ? 1.8 : 0.9;
-        entity.polyline.depthFailMaterial = planeShowing
-          ? (hue ? hue.line.withAlpha(0.18) : ACTIVE_COVERAGE_EDGE_DEPTHFAIL)
-          : undefined;
-      }
-    }
-
-    // Viewshed volume lifecycle: exists iff enabled + viewshed mode + in the
-    // visible set. Rebuild on active-tint flips (rare); otherwise leave the
-    // primitive alone so idle refreshes never churn geometry.
-    const wantVolume = !!(_enabled && viewshedOn && inVisibleSet && record.frustumPositions);
-    if (wantVolume) {
-      if (!record.viewshedPrimitive || record.viewshedActiveTint !== isActive) {
-        rebuildViewshedVolume(record, isActive);
-      }
-    } else if (record.viewshedPrimitive) {
-      destroyViewshedVolume(record);
-    }
-
-    if (record.projection) {
-      setPlaneVisible(record.projection, planeShowing);
-    }
-  }
-
-  if (_billboards) _billboards.show = !!_enabled;
-  pauseInactiveProjectionFeeds(activeId);
+  if (_arrows) _arrows.show = false;
+  governorRequestRender();
 }
 
 /**
@@ -3316,30 +1732,6 @@ function nearestCameraIdToViewer() {
 }
 
 /**
- * Counts how many other cameras have overlapping coverage with the target.
- * Overlap is approximated by comparing inter-camera distance against the
- * combined range of both cameras (scaled by 0.92).
- * @param {Object} targetRecord - Camera record to check.
- * @returns {number} Number of overlapping neighbors.
- */
-function coverageNeighborCount(targetRecord) {
-  if (!targetRecord) return 0;
-  let count = 0;
-  for (const record of _records) {
-    if (record === targetRecord) continue;
-    const dKm = haversineKm(
-      targetRecord.camera.lat,
-      targetRecord.camera.lon,
-      record.camera.lat,
-      record.camera.lon
-    );
-    const overlapKm = (targetRecord.camera.rangeM + record.camera.rangeM) / 1000 * 0.92;
-    if (dKm <= overlapKm) count++;
-  }
-  return count;
-}
-
-/**
  * Builds a single-line summary string for the active camera, including city,
  * heading, FOV, coverage area, overlap count, projection mode, alignment
  * confidence, source type, and view context.
@@ -3353,8 +1745,6 @@ function buildSummaryText() {
       : 'No cameras available in catalog.';
   }
 
-  const area = sectorAreaKm2(active.camera.rangeM, active.camera.fovDeg);
-  const overlapCount = coverageNeighborCount(active);
   const viewKey = currentViewContext();
   const viewBand = viewKey.split(':')[0] || 'global';
   const health = _healthById.get(active.camera.id) || null;
@@ -3365,10 +1755,6 @@ function buildSummaryText() {
     `${active.camera.name.toUpperCase()}`,
     `HDG ${Math.round(active.camera.headingDeg)}°`,
     `FOV ${Math.round(active.camera.fovDeg)}°`,
-    `COVERAGE ${area.toFixed(2)}km²`,
-    overlapCount > 0 ? `OVERLAP ${overlapCount} cams` : 'ISOLATED VIEW',
-    `PROJ ${_showProjection ? 'MONITOR' : 'OFF'}`,
-    _coverageMode === 'viewshed' ? 'VIEWSHED' : null,
     `CAL ${calBadge.replace('-', ' ').toUpperCase()}`,
     health?.sourceKind ? `SRC ${String(health.sourceKind).toUpperCase()}` : `SRC ${String(active.camera.feedType || 'image').toUpperCase()}`,
     `${viewBand.toUpperCase()} CONTEXT`,
@@ -3407,6 +1793,8 @@ function getPublicCameraState(record, activeId = null) {
     sourceStatus: health?.status || 'unknown',
     sourceMessage: health?.message || '',
     sourceLabel: health?.label || camera.provider || '',
+    detailUrl: camera.detailUrl || '',
+    playerUrls: camera.playerUrls || {},
     calibration: { ...normalizeCalibration(camera.calibration) },
     // Save-gated persistence (design §3e): true while the live pose carries
     // edits that have not been SAVEd (or RESET). Drives the CAL · EDITED chip.
@@ -3448,9 +1836,6 @@ function uiState() {
   const payload = {
     enabled: _enabled,
     // Compat boolean + the full tri-state (viewshed design §3b).
-    showCoverage: _coverageMode !== 'off',
-    coverageMode: _coverageMode,
-    showProjection: _showProjection,
     calibrationMode: _calibrationMode,
     autoHop: _autoHop,
     autoHopSuspended: _autoHopSuspended,
@@ -3462,19 +1847,6 @@ function uiState() {
       active: _geoLoading,
       loaded: Math.min(_geoLoadDone, _geoLoadTotal),
       total: _geoLoadTotal,
-    },
-    // Ambient card tier telemetry (QA harnesses assert the fetch pacing —
-    // minFrameFetchSpacingMs reads together with fetchMode: cold-fill bursts
-    // legitimately reach ~250 ms, steady state stays >=1000 ms).
-    ambientCards: {
-      count: _cardIds.size,
-      limit: CCTV_AMBIENT_CARD_MAX,
-      frameFetches: _cardFetchCount,
-      minFrameFetchSpacingMs: _cardMinFetchSpacingMs,
-      fetchMode: _cardFetchMode,
-      fetchesInFlight: _cardFetchInFlightCount,
-      // Item B QA seam: the hover-summoned pinned card, if any.
-      hoverId: _hoverCardId,
     },
     activeCameraId: activeId,
     activeCamera: active ? getPublicCameraState(active, activeId) : null,
@@ -3541,106 +1913,15 @@ function applyCalibrationPatch(record, patch, options = {}) {
   }
   record.calDirty = true;
   if (options.transient === true) {
-    applyFrustumGeometry(record, groundAltFor(record));
+    applyCameraPlacement(record, groundAltFor(record));
     notifyListenersThrottled();
     return true;
   }
   if (anchorMoved) {
     resolveCommittedGroundAnchor(record);
   } else {
-    applyFrustumGeometry(record, groundAltFor(record));
+    applyCameraPlacement(record, groundAltFor(record));
   }
-  refreshProjectionImage(record, true);
-  return true;
-}
-
-/**
- * Lazily creates the calibration gizmo controller. The gizmo sees the layer
- * only through these callbacks: it attaches to the active record while the
- * layer is enabled AND ADJUST mode is on, funnels drags through
- * applyCalibrationPatch (transient), and runs the commit tail on release.
- */
-function ensureGizmo() {
-  if (_gizmo || !_viewer) return;
-  // Both patch callbacks receive the gizmo's PINNED drag record — never
-  // re-resolve the active camera here: a mid-drag voice select or auto-hop
-  // would route the captured offsets onto a camera with a different basePose.
-  const liveRecord = (record) => (
-    record && _recordById.get(record.camera?.id) === record ? record : null
-  );
-  _gizmo = createCalibrationGizmo({
-    viewer: _viewer,
-    getActiveRecord: () => (_enabled && _calibrationMode ? getActiveRecord() : null),
-    applyPatch: (patch, draggedRecord) => {
-      const record = _enabled && _calibrationMode ? liveRecord(draggedRecord) : null;
-      if (record) applyCalibrationPatch(record, patch, { transient: true });
-    },
-    endPatch: (draggedRecord) => {
-      const record = liveRecord(draggedRecord);
-      if (!record) return;
-      if (record.calibrationAnchorDirty) {
-        record.calibrationAnchorDirty = false;
-        resolveCommittedGroundAnchor(record);
-      } else {
-        applyFrustumGeometry(record, groundAltFor(record));
-      }
-      refreshProjectionImage(record, true);
-      refreshCoverageStyles();
-      notifyListeners();
-    },
-  });
-}
-
-/**
- * §9.1 activation obstruction probe (LOCKED owner decision): on camera
- * ACTIVATION only, fire ONE scene.pickFromRay along the frustum axis
- * (mount → cap-center direction). If it hits the tiles closer than the pose
- * range, clamp the plane's effective range just short of the first hit so the
- * "big and dramatic" true end cap never clips into downtown buildings.
- *
- * This is the ONLY raycast in the whole CCTV subsystem — once per activation,
- * never per-frame (the zero-raycast invariant applies to steady state). The
- * per-camera range slider overrides the clamp: a user-set rangeScale skips the
- * probe entirely. Probe failure/miss keeps the unclamped range.
- * @param {Object} record - Camera record being activated.
- */
-function runActivationObstructionProbe(record) {
-  record.probeClampRangeM = null;
-  const scene = _viewer?.scene;
-  if (!scene || typeof scene.pickFromRay !== 'function') return;
-  const camera = record.camera;
-  const rangeScale = normalizeCalibration(camera.calibration).rangeScale;
-  if (Math.abs(rangeScale - 1) > 0.0001) return; // slider overrides the clamp
-  try {
-    const mountAlt = groundAltFor(record) + camera.mountHeightM;
-    const mountPos = Cesium.Cartesian3.fromDegrees(camera.lon, camera.lat, mountAlt);
-    const { dir } = frustumFrameEcef(camera, mountPos);
-    // Exclude everything the layer itself draws so the probe can only hit the
-    // world (3D tiles), not our own billboards/polylines/planes.
-    const exclude = [_billboards, ..._coverageEntities];
-    for (const runtime of _projectionEntities) {
-      if (runtime?.planeEntity) exclude.push(runtime.planeEntity);
-    }
-    const hit = scene.pickFromRay(new Cesium.Ray(mountPos, dir), exclude);
-    if (!hit?.position) return;
-    const dist = Cesium.Cartesian3.distance(mountPos, hit.position);
-    record.probeClampRangeM = activationProbeClampRange(camera.rangeM, dist);
-  } catch {
-    // probe failure → keep the unclamped range
-  }
-}
-
-/**
- * Clears a deactivated camera's temporary obstruction clamp and rewrites its
- * geometry through the normal single-range path.
- * @param {Object|null} record Camera runtime record being deactivated.
- * @param {(record: Object) => void} rewriteGeometry Nominal geometry rewrite.
- * @returns {boolean} Whether a clamp was cleared.
- */
-export function clearProbeClampOnDeactivation(record, rewriteGeometry) {
-  if (!record || !Number.isFinite(record.probeClampRangeM)) return false;
-  record.probeClampRangeM = null;
-  rewriteGeometry?.(record);
   return true;
 }
 
@@ -3694,22 +1975,6 @@ export function setActiveCamera(cameraId) {
   }
   _activeCameraId = cameraId;
   _autoHopSuspended = false;
-  // A real activation creates projection work — wake the self-stopping loop.
-  startProjectionLoop();
-  if (previousActiveRecord && previousActiveRecord !== record) {
-    clearProbeClampOnDeactivation(previousActiveRecord, (previous) => {
-      applyFrustumGeometry(previous, groundAltFor(previous));
-    });
-  }
-  // The clicked camera leaves the ambient quota immediately (never graced).
-  // Shipped behavior publishes no card for it because the monitor plane is
-  // now the active representation; the opt-in protected-card path republishes
-  // it synchronously through refreshAmbientCards() below.
-  _cardIds.delete(cameraId);
-  _cardGraceState.delete(cameraId);
-  // Activating the hovered camera consumes the transient pin; the active
-  // monitor plane replaces it from this moment.
-  if (_hoverCardId === cameraId) clearHoverCard();
   // If the record's geometry refinement is still queued, jump it to the front
   // so the newly active camera resolves before idle neighbors.
   const queueIdx = _geoQueue.indexOf(record);
@@ -3717,20 +1982,6 @@ export function setActiveCamera(cameraId) {
     _geoQueue.splice(queueIdx, 1);
     _geoQueue.unshift(record);
   }
-  // §9.1: one obstruction probe per activation, BEFORE the geometry pass so
-  // the range clamp lands in the same rewrite. A FIRST-EVER activation (no
-  // real ground sample yet) probes from the catalog-prior altitude — if that
-  // prior is off, the clamp is measured from a shifted origin, but a
-  // re-activation after the one-shot snap lands re-probes from real ground,
-  // so it self-corrects.
-  runActivationObstructionProbe(record);
-  // Coverage is activation-lazy even while the mode is OFF: the active
-  // camera's projection representation must be ready without materializing
-  // any idle neighbor. The following geometry rewrite welds these entities to
-  // the current sampled positions.
-  ensureActiveCoverageEntities(record);
-  ensureProjectionRuntime(record);
-  refreshProjectionImage(record, true);
   // FIX B9b: an explicit user (re)select re-arms one real ground sample for the
   // newly-active camera, then freezes. Idle neighbors keep their resolved state.
   // FIX B9c: if tiles are ready this real pass applies + re-resolves
@@ -3741,12 +1992,7 @@ export function setActiveCamera(cameraId) {
   rearmGroundResolution(record);
   updateRecordGeometry(record);
   record.activationDone = true;
-  refreshCoverageStyles();
-  // The newly active camera leaves the ambient ring (its monitor plane takes
-  // over); the freed slot re-fills on this same pass.
-  refreshAmbientCards();
-  // ADJUST mode follows the active camera.
-  _gizmo?.refresh();
+  refreshCameraStyles();
   notifyListeners();
   return CCTV_ACTIVATION_RESULT.ACTIVATED;
 }
@@ -3763,12 +2009,8 @@ export function deactivateActiveCamera() {
   _activeCameraId = null;
   _autoHopSuspended = true;
   record.activationDone = false;
-  clearProbeClampOnDeactivation(record, (previous) => {
-    applyFrustumGeometry(previous, groundAltFor(previous));
-  });
-  refreshCoverageStyles();
-  refreshAmbientCards();
-  _gizmo?.refresh();
+  applyCameraPlacement(record, groundAltFor(record));
+  refreshCameraStyles();
   notifyListeners();
   return true;
 }
@@ -3790,118 +2032,6 @@ export function cctvEmptyClickDeselects(picked, {
 } = {}) {
   if (!activeCameraId || calibrationMode) return false;
   return resolvePickId(picked) === null;
-}
-
-/**
- * Creates the five Cesium polyline entities that visualize a camera's pitched
- * frustum: 4 corner rays (mount → far-plane corner) + the closed far-plane
- * rectangle. Entity ids stay in the `cctv-<id>-<role>` scheme (pick-owner
- * regex depends on it): roles ray-tl / ray-tr / ray-br / ray-bl / cap.
- * @param {Object} record - Camera record.
- * @returns {Cesium.Entity[]} Array of five coverage entities.
- */
-function buildCoverageEntities(record) {
-  const { camera } = record;
-  // Prefer the record's already-refined geometry. Lazy creation commonly
-  // happens after the staggered ground pass; recomputing from the catalog
-  // prior here would regress the camera to its pre-sampled datum.
-  let geometry = record.frustumGeometry;
-  let positions = record.frustumPositions;
-  if (!geometry || !positions) {
-    geometry = computeFrustumGeometry(
-      camera,
-      groundPriorAltFor(record),
-      record.probeClampRangeM
-    );
-    positions = frustumCartesians(geometry);
-    record.frustumGeometry = geometry;
-    record.frustumPositions = positions;
-    record.position = positions.mount;
-  }
-
-  const addPolyline = (role, linePositions) => _viewer.entities.add({
-    id: `cctv-${camera.id}-${role}`,
-    properties: { cctvCameraId: camera.id },
-    polyline: {
-      positions: linePositions,
-      width: 1.2,
-      material: IDLE_COVERAGE_COLOR,
-    },
-  });
-
-  const entities = [
-    addPolyline('ray-tl', [positions.mount, positions.tl]),
-    addPolyline('ray-tr', [positions.mount, positions.tr]),
-    addPolyline('ray-br', [positions.mount, positions.br]),
-    addPolyline('ray-bl', [positions.mount, positions.bl]),
-    addPolyline('cap', [positions.tl, positions.tr, positions.br, positions.bl, positions.tl]),
-  ];
-
-  entities[0]._coverageRole = 'edge';
-  entities[1]._coverageRole = 'edge';
-  entities[2]._coverageRole = 'edge';
-  entities[3]._coverageRole = 'edge';
-  entities[4]._coverageRole = 'cap';
-  return entities;
-}
-
-/**
- * Materializes coverage entities for eligible records exactly once.
- * The helper is dependency-injected so unit tests can prove the enable policy
- * without constructing Cesium entities.
- *
- * @param {Object[]} records CCTV runtime records.
- * @param {(record: Object) => boolean} [isEligible] Eligibility predicate.
- * @param {(record: Object) => Object[]} buildEntities Coverage builder.
- * @returns {Object[]} Newly created entities across all eligible records.
- */
-export function materializeCctvCoverageEntities(
-  records,
-  isEligible = () => true,
-  buildEntities,
-) {
-  const created = [];
-  if (typeof buildEntities !== 'function') return created;
-  for (const record of Array.isArray(records) ? records : []) {
-    if (!record || record.coverageEntities?.length || !isEligible(record)) continue;
-    const entities = buildEntities(record);
-    record.coverageEntities = Array.isArray(entities) ? entities.filter(Boolean) : [];
-    created.push(...record.coverageEntities);
-  }
-  return created;
-}
-
-/** Materializes one active camera's coverage set. */
-export function materializeCctvActiveCoverageEntities(record, buildEntities) {
-  return materializeCctvCoverageEntities([record], () => true, buildEntities);
-}
-
-/** Materializes only records in the current coverage-visible ID set. */
-export function materializeCctvVisibleCoverageEntities(records, visibleIds, buildEntities) {
-  const eligibleIds = visibleIds instanceof Set ? visibleIds : new Set(visibleIds || []);
-  return materializeCctvCoverageEntities(
-    records,
-    (record) => eligibleIds.has(record.camera?.id),
-    buildEntities,
-  );
-}
-
-/** Registers newly built coverage entities with the layer-global collection. */
-function registerCoverageEntities(created) {
-  _coverageEntities.push(...created);
-  return created;
-}
-
-function ensureActiveCoverageEntities(record) {
-  return registerCoverageEntities(
-    materializeCctvActiveCoverageEntities(record, buildCoverageEntities),
-  );
-}
-
-function ensureVisibleCoverageEntities(records, visibleIds) {
-  return registerCoverageEntities(
-    materializeCctvVisibleCoverageEntities(records, visibleIds, buildCoverageEntities),
-  );
 }
 
 /**
@@ -3947,32 +2077,10 @@ export function _extractPickedCameraIdForTest(picked) {
   return extractPickedCameraId(picked);
 }
 
-/**
- * Removes all coverage entities and projection runtimes from the scene.
- */
-function destroyCoverageEntities() {
-  if (!_viewer) return;
-  for (const entity of _coverageEntities) {
-    _viewer.entities.remove(entity);
-  }
-  _coverageEntities = [];
-
-  for (const record of _records) {
-    destroyViewshedVolume(record);
-  }
-
-  for (const runtime of _projectionEntities) {
-    destroyProjectionRuntime(runtime);
-  }
-  _projectionEntities = [];
-}
-
 /** Resets all module-scoped runtime state to initial values. */
 function clearRuntimeState() {
   stopGeometryLoadQueue();
   // Idempotent — also covers a re-init without a prior destroy().
-  teardownAmbientCards();
-  clearProjectionOverlay();
   _records = [];
   _recordById = new Map();
   _healthById = new Map();
@@ -3988,43 +2096,6 @@ function clearRuntimeState() {
   // Task 5: the applied-regime tracker is record-set-scoped — a fresh init
   // recomputes it against the then-current scene.
   _lastAppliedRegime = null;
-}
-
-/**
- * Primes the minimum module state needed to exercise the production coverage
- * refresh path in unit tests.
- * @param {Object} [options={}] Test state values.
- * @param {Object|null} [options.viewer] Viewer-like entity owner.
- * @param {Object[]} [options.records] Seeded CCTV records.
- * @param {string|null} [options.activeCameraId] Active record id.
- * @param {boolean} [options.enabled=true] Layer enabled state.
- * @param {'off'|'on'|'viewshed'} [options.coverageMode='on'] Coverage mode.
- * @param {boolean} [options.showProjection=false] Projection visibility.
- * @returns {void}
- */
-export function _setCctvCoverageStateForTest({
-  viewer = null,
-  records = [],
-  activeCameraId = null,
-  enabled = true,
-  coverageMode = 'on',
-  showProjection = false,
-} = {}) {
-  _viewer = viewer;
-  _records = Array.isArray(records) ? records : [];
-  _recordById = new Map(
-    _records
-      .filter((record) => record?.camera?.id)
-      .map((record) => [record.camera.id, record]),
-  );
-  _coverageEntities = [];
-  _projectionEntities = [];
-  _billboards = null;
-  _activeCameraId = activeCameraId;
-  _autoHopSuspended = false;
-  _enabled = !!enabled;
-  _coverageMode = normalizeCoverageMode(coverageMode, 'on');
-  _showProjection = !!showProjection;
 }
 
 /**
@@ -4046,20 +2117,31 @@ export function focusCctvRecord(viewer, record, duration = 2.2) {
     console.debug('[Data:CCTV] focus ignored while a tracked entity owns the camera');
     return CCTV_FOCUS_RESULT.TRACKING_HOLDS_VIEW;
   }
-  const { camera } = record;
-  const range = Math.max(280, camera.rangeM * 1.18);
-  viewer.camera.flyToBoundingSphere(
-    new Cesium.BoundingSphere(record.position, Math.max(40, camera.rangeM * 0.36)),
-    {
-      offset: new Cesium.HeadingPitchRange(
-        toRad(camera.headingDeg),
-        toRad(-22),
-        range
-      ),
-      duration: Math.max(0.2, duration || 0),
-      easingFunction: Cesium.EasingFunction.CUBIC_IN_OUT,
-    }
-  );
+  // Overhead recentre, NOT a zoom: hold the operator's current eye height and
+  // only translate over the camera, then look straight down. The old flight
+  // chose its own range from camera.rangeM, which yanked the view to a scale
+  // the operator did not ask for on every selection.
+  const carto = viewer.camera.positionCartographic;
+  const eyeHeightM = Number.isFinite(carto?.height) ? carto.height : NaN;
+  const groundAlt = safeNumber(record.camera.absoluteHeightM, 0);
+  // Fall back to a sane standoff only when the current height is unusable
+  // (uninitialised camera), and never drop below the camera's own altitude.
+  const height = Number.isFinite(eyeHeightM)
+    ? Math.max(eyeHeightM, groundAlt + MIN_OVERHEAD_STANDOFF_M)
+    : groundAlt + DEFAULT_OVERHEAD_STANDOFF_M;
+
+  viewer.camera.flyTo({
+    destination: Cesium.Cartesian3.fromDegrees(record.camera.lon, record.camera.lat, height),
+    orientation: {
+      // Heading is preserved so the surrounding streets keep the orientation
+      // the operator already had; only the pitch snaps to nadir.
+      heading: viewer.camera.heading,
+      pitch: toRad(-90),
+      roll: 0,
+    },
+    duration: Math.max(0.2, duration || 0),
+    easingFunction: Cesium.EasingFunction.CUBIC_IN_OUT,
+  });
   return CCTV_FOCUS_RESULT.FOCUSED;
 }
 
@@ -4186,6 +2268,16 @@ const cctvLayer = {
     _calibrationById = loadCalibrationStore();
 
     _billboards = new Cesium.BillboardCollection();
+    // One PolylineCollection for every arrow: a per-camera entity would put
+    // hundreds of primitives in the scene for a decoration that never picks.
+    _arrows = new Cesium.PolylineCollection();
+    _viewer.scene.primitives.add(_arrows);
+    _arrowMaterialActive = Cesium.Material.fromType(Cesium.Material.PolylineArrowType, {
+      color: ACTIVE_CAMERA_COLOR,
+    });
+    _arrowMaterialIdle = Cesium.Material.fromType(Cesium.Material.PolylineArrowType, {
+      color: IDLE_CAMERA_COLOR.withAlpha(0.7),
+    });
     _viewer.scene.primitives.add(_billboards);
     registerSpriteCollection('cctv', _billboards);
 
@@ -4254,10 +2346,17 @@ const cctvLayer = {
         scaleByDistance: new Cesium.NearFarScalar(350, 1.25, 4_000_000, 0.42),
       });
 
+      const arrow = _arrows.add({
+        positions: [position, position],
+        width: ARROW_WIDTH_IDLE,
+        material: _arrowMaterialIdle,
+      });
+
       const record = {
         camera,
         position,
         billboard,
+        arrow,
         coverageEntities: [],
         projection: null,
         // Task 5 (height-datum fix): regime-aware ground resolution state.
@@ -4288,7 +2387,6 @@ const cctvLayer = {
         probeClampRangeM: null,
         // Viewshed (design §3a/§3b): per-camera color identity + the volume
         // primitive handle (exists only in viewshed mode for the visible set).
-        viewshedColors: viewshedColors(cameraHue(hueIndexById.get(camera.id) ?? 0)),
         viewshedPrimitive: null,
         viewshedActiveTint: false,
       };
@@ -4334,7 +2432,6 @@ const cctvLayer = {
       _horizonCullListener = () => {
         _cameraMoving = false;
         refreshHorizonCulling();
-        refreshAmbientCards();
       };
       _viewer.camera.moveEnd.addEventListener(_horizonCullListener);
     }
@@ -4362,35 +2459,16 @@ const cctvLayer = {
       // remain eligible for true empty-space deselection.
       const pickedId = resolvePickId(picked);
       if (pickedId !== null) return;
-      // Item A (owner round 2): the scene pick found no camera — try the
-      // painted ambient cards. The cards canvas is pointer-events:none (this
-      // handler owns the events), so a click landing on a card's rect selects
-      // its camera exactly like a click on the icon. Cesium click positions
-      // and the recorded rects are both CSS px — direct comparison.
-      const cardId = _cctvOverlayHost.hitTest(
-        click.position.x,
-        click.position.y,
-        { sourceId: CCTV_OVERLAY_SOURCE_ID },
-      )?.entryId;
-      if (cardId && _recordById.has(cardId)) {
-        activateCctvCameraFromWorldClick(cardId, setActiveCamera);
-        return;
-      }
       if (cctvEmptyClickDeselects(picked, {
         activeCameraId: _activeCameraId,
         calibrationMode: _calibrationMode,
       })) {
         deactivateActiveCamera();
       }
-    }, {
-      // Item B: hover summons a card on a cardless camera icon. The gesture
-      // classifier owns MOUSE_MOVE too, so chain hover work through its seam
-      // instead of replacing the travel accumulator's handler.
-      onMouseMove: (movement) => handleHoverMove(movement?.endPosition),
     });
 
     await syncHealthState(true);
-    refreshCoverageStyles();
+    refreshCameraStyles();
     notifyListeners();
     restoreSpriteOrder(_viewer);
     console.log('[Data:CCTV] Initialized with', _count, 'cameras');
@@ -4409,7 +2487,6 @@ const cctvLayer = {
     // coverage polyline entities use `cctv-<cameraId>-<role>` entity ids.
     registerPickOwner('cctv', (pickedId) => {
       if (_recordById.has(pickedId)) return true;
-      if (typeof pickedId === 'string' && pickedId.startsWith(GIZMO_ID_PREFIX)) return true;
       const coverage = /^cctv-(.+)-(?:ray-tl|ray-tr|ray-br|ray-bl|cap|plane|plane-label)$/.exec(pickedId);
       return Boolean(coverage && _recordById.has(coverage[1]));
     });
@@ -4419,22 +2496,9 @@ const cctvLayer = {
     }
     const activeRecord = getActiveRecord();
     if (activeRecord) {
-      ensureProjectionRuntime(activeRecord);
-      refreshProjectionImage(activeRecord, true);
     }
     startGeometryLoadQueue();
-    refreshCoverageStyles();
-    startProjectionLoop();
-    // The projection loop self-stops when idle; a focus target appearing
-    // (user starts tracking a contact) is the one edge it can't see while
-    // stopped, so re-arm on it. Removed on disable.
-    _removeFocusAppearListener?.();
-    _removeFocusAppearListener = onFocusTargetAppear(() => startProjectionLoop());
-    // Ambient card tier: shared host source + policy-gated frame pacer + the
-    // initial selection pass (moveEnd drives every later reselection).
-    _cctvOverlayHost.setVisible(CCTV_OVERLAY_SOURCE_ID, true);
-    startCardFrameLoop();
-    refreshAmbientCards();
+    refreshCameraStyles();
     notifyListeners();
     restoreSpriteOrder(_viewer);
   },
@@ -4446,14 +2510,11 @@ const cctvLayer = {
     // ADJUST mode does not survive a layer toggle — predictable re-entry.
     _calibrationMode = false;
     releaseContinuousRender('cctv-adjust');
-    _gizmo?.setEnabled(false);
     _removeFocusAppearListener?.();
     _removeFocusAppearListener = null;
-    stopProjectionLoop();
     stopGeometryLoadQueue();
     // Ambient cards tear down COMPLETELY on disable (owner design point 6):
     // source entries, pacer timer, in-flight handlers, and caches.
-    teardownAmbientCards();
     hideCctvVisuals();
     notifyListeners();
   },
@@ -4466,7 +2527,7 @@ const cctvLayer = {
    * completion pass: the enable-time drain can run while 3D tiles are still
    * streaming (each such pass keeps the fabricated catalog height and leaves
    * the record `!groundResolved`), so the FIRST tick that sees
-   * projectionTilesReady() re-enqueues those records once — each then takes
+   * photorealTilesReady() re-enqueues those records once — each then takes
    * its single real sample and freezes (design §4). Guarded by a boolean
    * latch (`_tilesReadyReenqueued`), NOT a timer loop: after it fires, no
    * tick ever samples anything again.
@@ -4475,11 +2536,11 @@ const cctvLayer = {
     if (!_enabled) return;
     const now = Date.now();
     _lastUpdate = now;
-    if (!_tilesReadyReenqueued && projectionTilesReady()) {
+    if (!_tilesReadyReenqueued && photorealTilesReady()) {
       _tilesReadyReenqueued = true;
       // Per-regime resolution (Task 5): only records unresolved for the
       // CURRENT surface regime need the completion pass. On globe stacks
-      // projectionTilesReady() is false while a (hidden) Google tileset
+      // photorealTilesReady() is false while a (hidden) Google tileset
       // exists, so this latch effectively fires for the google-3d regime —
       // terrain-globe records resolve from the prior in their drain pass.
       const unresolved = _records.filter((record) => !isGroundResolved(record));
@@ -4510,10 +2571,6 @@ const cctvLayer = {
       teardownViewer.camera.moveStart.removeEventListener(_moveStartListener);
       _moveStartListener = null;
     }
-    if (_gizmo) {
-      _gizmo.destroy();
-      _gizmo = null;
-    }
     _calibrationMode = false;
     releaseContinuousRender('cctv-adjust');
     if (_clickHandler) {
@@ -4523,13 +2580,16 @@ const cctvLayer = {
     if (teardownViewer?.scene?.screenSpaceCameraController) {
       teardownViewer.scene.screenSpaceCameraController.enableInputs = true;
     }
-    stopProjectionLoop();
     stopGeometryLoadQueue();
-    teardownAmbientCards();
-    destroyCoverageEntities();
     if (_billboards && teardownViewer) {
       teardownViewer.scene.primitives.remove(_billboards);
       _billboards = null;
+    }
+    if (_arrows && teardownViewer) {
+      teardownViewer.scene.primitives.remove(_arrows);
+      _arrows = null;
+      _arrowMaterialActive = null;
+      _arrowMaterialIdle = null;
     }
     clearRuntimeState();
     _viewer = null;
@@ -4559,20 +2619,6 @@ const cctvLayer = {
    * @param {number} [params.focusDurationSec] - Fly-to duration.
    */
   setParams(params = {}) {
-    if (typeof params.showCoverage === 'boolean') {
-      _coverageMode = normalizeCoverageMode(params.showCoverage, _coverageMode);
-    }
-    if (typeof params.coverageMode === 'string') {
-      _coverageMode = normalizeCoverageMode(params.coverageMode, _coverageMode);
-    }
-    if (typeof params.showProjection === 'boolean') {
-      _showProjection = params.showProjection;
-      if (_showProjection) {
-        const active = getActiveRecord();
-        if (active) ensureProjectionRuntime(active);
-        startProjectionLoop();
-      }
-    }
     if (typeof params.autoHop === 'boolean') {
       _autoHop = params.autoHop;
       if (params.autoHop) _autoHopSuspended = false;
@@ -4601,7 +2647,6 @@ const cctvLayer = {
           saveCalibrationStore();
           // Reset returns to the base lat/lon, so resolve that anchor once.
           resolveCommittedGroundAnchor(targetRecord);
-          refreshProjectionImage(targetRecord, true);
         }
         if (calibrationCfg.patch && typeof calibrationCfg.patch === 'object') {
           // Save-gated persistence (design §3e): a patch edits the LIVE pose
@@ -4633,20 +2678,17 @@ const cctvLayer = {
     if (typeof params.calibrationMode === 'boolean') {
       _calibrationMode = params.calibrationMode;
       if (_calibrationMode) {
-        ensureGizmo();
-        _gizmo?.setEnabled(true);
         // ADJUST mode: gizmo drags mutate entity geometry from pointer events,
         // which don't trigger renders in requestRenderMode. (perf wave 2)
         holdContinuousRender('cctv-adjust');
       } else {
         releaseContinuousRender('cctv-adjust');
-        _gizmo?.setEnabled(false);
       }
     }
     if (params.focusSelected && _activeCameraId) {
       focusCamera(_activeCameraId, Number(params.focusDurationSec) || 1.8);
     }
-    refreshCoverageStyles();
+    refreshCameraStyles();
     notifyListeners();
   },
 
@@ -4658,9 +2700,6 @@ const cctvLayer = {
   getParams() {
     const active = getActiveRecord();
     return {
-      showCoverage: _coverageMode !== 'off',
-      coverageMode: _coverageMode,
-      showProjection: _showProjection,
       calibrationMode: _calibrationMode,
       autoHop: _autoHop,
       autoHopSec: _autoHopSec,
@@ -4694,7 +2733,10 @@ const cctvLayer = {
       objects.push({
         position: _records[i].position,
         sourceId: camera.id,
-        id: `CAM-${camera.id}`,
+        // The overlay draws `id` as the label's primary line; identity and
+        // dedupe run off sourceId above, so this carries the place name rather
+        // than the record id, which told an operator nothing in-world.
+        id: cctvLocationLabel(camera),
         type: 'CAM',
       });
       if (objects.length >= maxCount) break;
@@ -4739,18 +2781,6 @@ const cctvLayer = {
    */
   getUIState() {
     return uiState();
-  },
-
-  /**
-   * Opts the active camera into or out of protected thumbnail publication.
-   * The default is false: the monitor plane remains the sole active-camera
-   * representation while ambient and hover-pinned cards continue unchanged.
-   * @param {Object} [options]
-   * @param {boolean} [options.activeCameraCardEnabled=false]
-   * @returns {{activeCameraCardEnabled:boolean}}
-   */
-  setCardPresentationOptions(options = {}) {
-    return setCctvCardPresentationOptions(options);
   },
 
   /**

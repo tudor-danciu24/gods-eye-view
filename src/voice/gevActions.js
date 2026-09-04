@@ -1110,10 +1110,6 @@ export async function controlCctv(dataManager, args = {}, styleManager = null) {
       activeCameraId: ui.activeCameraId || null,
       activeCamera: ui.activeCamera?.name || ui.activeCamera?.id || null,
       cameraCount: Array.isArray(ui.cameras) ? ui.cameras.length : (ui.count || 0),
-      showCoverage: !!ui.showCoverage,
-      coverageMode: ui.coverageMode || (ui.showCoverage ? 'on' : 'off'),
-      showProjection: !!ui.showProjection,
-      calibrationMode: !!ui.calibrationMode,
       autoHop: !!ui.autoHop,
     };
   };
@@ -1172,30 +1168,10 @@ export async function controlCctv(dataManager, args = {}, styleManager = null) {
       : CCTV_FOCUS_RESULT.NO_ACTIVE_CAMERA;
     return { action: 'control_cctv', ...summarize(), ...cctvVoiceFocusOutcome(focusResult) };
   }
-  if (action === 'viewshed') {
-    // Color-coded coverage volumes; enabled:false drops back to plain
-    // coverage wireframes (not off — "hide coverage" is the coverage action).
-    const next = (typeof args.enabled === 'boolean' && !args.enabled) ? 'on' : 'viewshed';
-    dataManager.setLayerParams('cctv', { coverageMode: next }, { origin: 'voice' });
-    return { ok: true, action: 'control_cctv', ...summarize() };
-  }
-  if (action === 'adjust') {
+  if (action === 'autohop') {
     const current = summarize();
-    const next = typeof args.enabled === 'boolean' ? args.enabled : !current.calibrationMode;
-    dataManager.setLayerParams('cctv', { calibrationMode: next }, { origin: 'voice' });
-    return { ok: true, action: 'control_cctv', ...summarize() };
-  }
-  if (action === 'coverage') {
-    const current = summarize();
-    const next = typeof args.enabled === 'boolean' ? args.enabled : !current.showCoverage;
-    dataManager.setLayerParams('cctv', { coverageMode: next ? 'on' : 'off' }, { origin: 'voice' });
-    return { ok: true, action: 'control_cctv', ...summarize() };
-  }
-  if (action === 'projection' || action === 'autohop') {
-    const key = action === 'projection' ? 'showProjection' : 'autoHop';
-    const current = summarize();
-    const next = typeof args.enabled === 'boolean' ? args.enabled : !current[key];
-    dataManager.setLayerParams('cctv', { [key]: next }, { origin: 'voice' });
+    const next = typeof args.enabled === 'boolean' ? args.enabled : !current.autoHop;
+    dataManager.setLayerParams('cctv', { autoHop: next }, { origin: 'voice' });
     return { ok: true, action: 'control_cctv', ...summarize() };
   }
   throw new Error(`Unknown CCTV action: ${args.action || 'missing'}`);

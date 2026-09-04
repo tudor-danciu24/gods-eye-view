@@ -109,23 +109,12 @@ export const DATA_CREDITS = [
       '(location-matched article links; publisher terms apply)',
   },
   {
-    key: 'austin-cctv',
+    // Attribution is REQUIRED by the Windy Webcams API terms, alongside the
+    // per-camera link rendered in the CCTV panel. Do not drop either half.
+    key: 'windy-webcams',
     html:
-      'CCTV cameras &amp; frames: City of Austin, TX — ' +
-      '<a href="https://data.austintexas.gov" target="_blank" rel="noopener">data.austintexas.gov</a>',
-  },
-  {
-    key: 'caltrans-cctv',
-    html:
-      'CCTV cameras &amp; frames (California): Caltrans — ' +
-      '<a href="https://cwwp2.dot.ca.gov/" target="_blank" rel="noopener">cwwp2.dot.ca.gov</a>',
-  },
-  {
-    key: 'tfl-cctv',
-    html:
-      'CCTV cameras &amp; frames (London): ' +
-      '<a href="https://tfl.gov.uk/info-for/open-data-users/" target="_blank" rel="noopener">Powered by TfL Open Data</a>. ' +
-      'Contains OS data © Crown copyright and database rights.',
+      'CCTV cameras &amp; frames worldwide: Webcams provided by ' +
+      '<a href="https://www.windy.com/-Webcams/webcams" target="_blank" rel="noopener">Windy.com</a>',
   },
   {
     key: 'gbfs',

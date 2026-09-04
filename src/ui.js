@@ -2336,11 +2336,8 @@ export class StyleManager {
     this._cctvNextBtn = document.getElementById('cctv-next-btn');
     this._cctvSelect = document.getElementById('cctv-camera-select');
     this._cctvFocusBtn = document.getElementById('cctv-focus-btn');
-    this._cctvCoverageBtn = document.getElementById('cctv-coverage-btn');
     this._cctvAutoHopBtn = document.getElementById('cctv-auto-hop-btn');
-    this._cctvProjectionBtn = document.getElementById('cctv-projection-btn');
     this._cctvQualityChip = document.getElementById('cctv-quality-chip');
-    this._cctvAdjustBtn = document.getElementById('cctv-adjust-btn');
     this._cctvCalReadout = document.getElementById('cctv-cal-readout');
     this._cctvCalibSaveBtn = document.getElementById('cctv-calib-save-btn');
     this._cctvCalibResetBtn = document.getElementById('cctv-calib-reset-btn');
@@ -2350,6 +2347,12 @@ export class StyleManager {
     this._cctvFramePreloader = null;
     this._cctvSourceBadge = document.getElementById('cctv-source-badge');
     this._cctvMeta = document.getElementById('cctv-meta');
+    this._cctvSourceLink = document.getElementById('cctv-source-link');
+    this._cctvPlayer = document.getElementById('cctv-player');
+    this._cctvRangeButtons = Array.from(document.querySelectorAll('.cctv-range-btn[data-cctv-range]'));
+    // 'live' is the still frame; every other range is a Windy timelapse embed.
+    this._cctvPlayerRange = 'live';
+    this._bindCctvPlayerRange();
     this._cctvSummary = document.getElementById('cctv-summary');
     this._shareBtn = document.getElementById('share-btn');
     this._clearSelectedLayersBtn = document.getElementById('clear-selected-layers');
@@ -6177,26 +6180,9 @@ export class StyleManager {
       this._dataManager?.setLayerParams('cctv', { selectedCameraId: selected }, { origin: 'user' });
     });
 
-    this._cctvCoverageBtn?.addEventListener('click', () => {
-      const current = this._cctvState?.coverageMode
-        || (this._cctvState?.showCoverage ? 'on' : 'off');
-      const next = current === 'off' ? 'on' : current === 'on' ? 'viewshed' : 'off';
-      this._dataManager?.setLayerParams('cctv', { coverageMode: next }, { origin: 'user' });
-    });
-
     this._cctvAutoHopBtn?.addEventListener('click', () => {
       const current = !!this._cctvState?.autoHop;
       this._dataManager?.setLayerParams('cctv', { autoHop: !current }, { origin: 'user' });
-    });
-
-    this._cctvProjectionBtn?.addEventListener('click', () => {
-      const current = this._cctvState?.showProjection !== false;
-      this._dataManager?.setLayerParams('cctv', { showProjection: !current }, { origin: 'user' });
-    });
-
-    this._cctvAdjustBtn?.addEventListener('click', () => {
-      const current = !!this._cctvState?.calibrationMode;
-      this._dataManager?.setLayerParams('cctv', { calibrationMode: !current }, { origin: 'user' });
     });
 
     // Click-to-edit pose readout: each chip swaps to a number input; Enter or
@@ -6438,12 +6424,6 @@ export class StyleManager {
    */
   _syncCctvCalReadout(enabled, activeCamera) {
     const canCalibrate = !!enabled && !!activeCamera;
-    if (this._cctvAdjustBtn) {
-      const adjustOn = !!this._cctvState?.calibrationMode;
-      this._cctvAdjustBtn.classList.toggle('active', adjustOn && canCalibrate);
-      this._cctvAdjustBtn.textContent = adjustOn ? 'ADJUST ON' : 'ADJUST';
-      this._cctvAdjustBtn.disabled = !canCalibrate;
-    }
     if (this._cctvCalReadout) {
       for (const chip of this._cctvCalReadout.querySelectorAll('.cctv-cal-value')) {
         if (chip.querySelector('input')) continue; // an edit is in flight — don't clobber
@@ -6574,29 +6554,11 @@ export class StyleManager {
       this._cctvFocusBtn.disabled = !enabled || cameras.length === 0 || !activeId;
     }
 
-    if (this._cctvCoverageBtn) {
-      // Tri-state (viewshed design §3b): off → on (wireframes) → viewshed
-      // (color-coded volumes). The click handler cycles; this renders.
-      const mode = state?.coverageMode || (state?.showCoverage ? 'on' : 'off');
-      this._cctvCoverageBtn.classList.toggle('active', mode !== 'off');
-      this._cctvCoverageBtn.textContent = mode === 'viewshed'
-        ? 'VIEWSHED ON'
-        : mode === 'on' ? 'COVERAGE ON' : 'COVERAGE OFF';
-      this._cctvCoverageBtn.disabled = !enabled;
-    }
-
     if (this._cctvAutoHopBtn) {
       const autoHop = !!state?.autoHop;
       this._cctvAutoHopBtn.classList.toggle('active', autoHop);
       this._cctvAutoHopBtn.textContent = autoHop ? 'AUTO HOP ON' : 'AUTO HOP OFF';
       this._cctvAutoHopBtn.disabled = !enabled;
-    }
-
-    if (this._cctvProjectionBtn) {
-      const showProjection = state?.showProjection !== false;
-      this._cctvProjectionBtn.classList.toggle('active', showProjection);
-      this._cctvProjectionBtn.textContent = showProjection ? 'PROJECTION ON' : 'PROJECTION OFF';
-      this._cctvProjectionBtn.disabled = !enabled;
     }
 
     if (this._cctvQualityChip) {
@@ -6622,8 +6584,7 @@ export class StyleManager {
         const provider = activeCamera.sourceLabel || activeCamera.provider || 'Configured Source';
         const statusMsg = activeCamera.sourceMessage ? ` · ${activeCamera.sourceMessage}` : '';
         const calBadge = activeCamera.calBadge ? this._calBadgeLabel(activeCamera.calBadge) : '';
-        const projLabel = state?.showProjection !== false ? 'MONITOR' : 'OFF';
-        this._cctvMeta.textContent = `${activeCamera.city} · HDG ${Math.round(activeCamera.headingDeg)}° · FOV ${Math.round(activeCamera.fovDeg)}° · RANGE ${Math.round(activeCamera.rangeM)}m · ${projLabel}${calBadge ? ` · ${calBadge}` : ''} · ${provider}${statusMsg}`;
+        this._cctvMeta.textContent = `${activeCamera.city} · HDG ${Math.round(activeCamera.headingDeg)}°${calBadge ? ` · ${calBadge}` : ''} · ${provider}${statusMsg}`;
       } else if (cameras.length > 0) {
         this._cctvMeta.textContent = enabled
           ? `${cameras.length} cameras loaded · click a camera to activate`
@@ -6650,8 +6611,83 @@ export class StyleManager {
       }
     }
 
+    // Windy's API terms require every displayed frame to link back to its
+    // webcam page. No URL means no link element — never a fabricated href.
+    if (this._cctvSourceLink) {
+      const detailUrl = enabled ? (activeCamera?.detailUrl || '') : '';
+      if (detailUrl) {
+        this._cctvSourceLink.href = detailUrl;
+        this._cctvSourceLink.textContent = `VIEW ON ${(activeCamera?.provider || 'SOURCE').toUpperCase()} ↗`;
+        this._cctvSourceLink.hidden = false;
+      } else {
+        this._cctvSourceLink.removeAttribute('href');
+        this._cctvSourceLink.hidden = true;
+      }
+    }
+
+    this._syncCctvPlayer(enabled ? activeCamera : null);
     this._syncCctvSourceBadge(activeCamera, enabled);
     this._typeCctvSummary(state?.summary || 'Enable CCTV to start camera-linked intelligence summaries.');
+  }
+
+  /**
+   * Wires the timelapse range selector. Selecting a range only changes which
+   * surface is shown; it never fetches or builds a URL itself.
+   * @returns {void}
+   */
+  _bindCctvPlayerRange() {
+    for (const btn of this._cctvRangeButtons) {
+      btn.addEventListener('click', () => {
+        if (btn.disabled) return;
+        this._cctvPlayerRange = btn.dataset.cctvRange || 'live';
+        this._syncCctvPlayer(this._lastCctvActiveCamera || null);
+      });
+    }
+  }
+
+  /**
+   * Shows either the live still or a Windy timelapse embed for the active
+   * camera, and enables only the ranges that camera actually publishes.
+   *
+   * The iframe src is ALWAYS a server-pinned URL from the source registry —
+   * never assembled here from a camera id, which would be a client-built
+   * upstream URL of exactly the kind the CCTV proxy refuses.
+   *
+   * @param {object|null} activeCamera
+   * @returns {void}
+   */
+  _syncCctvPlayer(activeCamera) {
+    this._lastCctvActiveCamera = activeCamera || null;
+    const urls = activeCamera?.playerUrls || {};
+
+    for (const btn of this._cctvRangeButtons) {
+      const range = btn.dataset.cctvRange || 'live';
+      const available = range === 'live' ? !!activeCamera : !!urls[range];
+      btn.disabled = !available;
+      // A range the camera does not publish must not stay selected-looking.
+      if (!available && this._cctvPlayerRange === range) this._cctvPlayerRange = 'live';
+    }
+
+    const range = this._cctvPlayerRange;
+    const playerUrl = range === 'live' ? '' : (urls[range] || '');
+    for (const btn of this._cctvRangeButtons) {
+      btn.classList.toggle('is-active', (btn.dataset.cctvRange || 'live') === range);
+    }
+
+    if (!this._cctvPlayer) return;
+    if (playerUrl) {
+      if (this._cctvPlayer.getAttribute('src') !== playerUrl) {
+        this._cctvPlayer.setAttribute('src', playerUrl);
+      }
+      this._cctvPlayer.hidden = false;
+      if (this._cctvFrame) this._cctvFrame.style.visibility = 'hidden';
+    } else {
+      // Drop the src on the way out: a hidden iframe left pointed at the embed
+      // keeps loading and animating a timelapse nobody is looking at.
+      if (this._cctvPlayer.hasAttribute('src')) this._cctvPlayer.removeAttribute('src');
+      this._cctvPlayer.hidden = true;
+      if (this._cctvFrame) this._cctvFrame.style.visibility = '';
+    }
   }
 
   /**

@@ -1734,35 +1734,6 @@ test('voice CCTV select, next, prev, and nearest report tracking-refused flights
   ]);
 });
 
-test('voice CCTV coverage writes the canonical durable coverage mode', async () => {
-  let coverageMode = 'viewshed';
-  const calls = [];
-  const cctv = {
-    getUIState: () => ({
-      coverageMode,
-      showCoverage: coverageMode !== 'off',
-    }),
-  };
-  const dataManager = {
-    layers: new Map([['cctv', { module: cctv }]]),
-    isEnabled: () => true,
-    setLayerParams(layerId, params, options) {
-      calls.push([layerId, params, options]);
-      coverageMode = params.coverageMode;
-    },
-  };
-
-  let result = await controlCctv(dataManager, { action: 'coverage' });
-  assert.equal(result.coverageMode, 'off');
-
-  result = await controlCctv(dataManager, { action: 'coverage', enabled: true });
-  assert.equal(result.coverageMode, 'on');
-  assert.deepEqual(calls, [
-    ['cctv', { coverageMode: 'off' }, { origin: 'voice' }],
-    ['cctv', { coverageMode: 'on' }, { origin: 'voice' }],
-  ]);
-});
-
 test('voice Radio resolves Austin and exposes semantic selection, volume, pause, and stop', async () => {
   const austin = knownRadioLocation('', 'austin');
   assert.ok(Math.abs(austin.lat - 30.31) < 0.1);
@@ -3020,3 +2991,4 @@ test('front5: 0.99 km due EAST is the subject, though a degree box rejects it', 
     assert.equal(result.window.centeredOn, 'N546PC');
   });
 });
+

@@ -6278,6 +6278,69 @@ body.cockpit-mode #intel-hud .hud-right-edge { right: 22px; }
   color: var(--text-secondary);
 }
 
+#cctv-player {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: #000;
+}
+
+.cctv-player-range {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.cctv-range-btn {
+  flex: 1 1 auto;
+  border: 1px solid rgba(0, 212, 255, 0.28);
+  border-radius: 3px;
+  background: rgba(0, 212, 255, 0.06);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 8px;
+  letter-spacing: 1.2px;
+  padding: 4px 2px;
+  cursor: pointer;
+}
+
+.cctv-range-btn:hover:not(:disabled) {
+  color: #9defff;
+  border-color: rgba(0, 212, 255, 0.6);
+}
+
+.cctv-range-btn.is-active {
+  color: #041018;
+  background: #9defff;
+  border-color: #9defff;
+}
+
+.cctv-range-btn:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
+
+/* Required by the Windy Webcams API terms: every displayed frame links back
+   to its webcam page. Styled as a quiet caption under the frame, not a CTA. */
+.cctv-source-link {
+  align-self: flex-start;
+  font-family: var(--font-mono);
+  font-size: 8px;
+  letter-spacing: 1.3px;
+  color: var(--text-secondary);
+  text-decoration: none;
+  border-bottom: 1px dotted rgba(0, 212, 255, 0.4);
+  padding-bottom: 1px;
+}
+
+.cctv-source-link:hover,
+.cctv-source-link:focus-visible {
+  color: #9defff;
+  border-bottom-color: rgba(0, 212, 255, 0.8);
+}
+
 #cctv-source-badge {
   align-self: flex-start;
   border: 1px solid rgba(0, 212, 255, 0.32);

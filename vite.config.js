@@ -3469,34 +3469,86 @@ function isVideoFeedType(feedType) {
 // CCTV proxy constants and source cache state
 // ---------------------------------------------------------------------------
 /** Path to the optional static CCTV source list (JSON array). */
-const DEFAULT_CCTV_SOURCE_FILE = 'config/cctv_sources.austin.json';
-/** Austin Open Data portal endpoint for traffic camera records. */
-const DEFAULT_AUSTIN_ROWS_URL = 'https://data.austintexas.gov/api/views/b4k4-adkb/rows.json?accessType=DOWNLOAD';
-/** Default cap on Austin cameras after distance-based prioritization. */
-const DEFAULT_AUSTIN_MAX_SOURCES = 250;
+const DEFAULT_CCTV_SOURCE_FILE = 'config/cctv_sources.windy.json';
 /** Global cap on total CCTV sources served by the proxy. */
 const DEFAULT_CCTV_MAX_SOURCES = 900;
-/** Reference point for Austin camera prioritization (Congress & 6th). */
-const AUSTIN_DOWNTOWN = { lat: 30.2672, lon: -97.7431 };
-/** Caltrans CCTV: one JSON feed per district, identical schema statewide. */
-const CALTRANS_CCTV_URL = (district) =>
-  `https://cwwp2.dot.ca.gov/data/d${district}/cctv/cctvStatusD${String(district).padStart(2, '0')}.json`;
-/** Districts fetched by default: SF Bay (4), LA (7), San Diego (11), Sacramento (3). */
-const DEFAULT_CALTRANS_DISTRICTS = '4,7,11,3';
-const DEFAULT_CALTRANS_MAX_SOURCES = 300;
-/** Prioritization anchors: downtown cores of the four default metros. */
-const CALTRANS_ANCHORS = [
-  { lat: 37.7793, lon: -122.4193 }, // San Francisco
-  { lat: 34.0537, lon: -118.2428 }, // Los Angeles
-  { lat: 32.7157, lon: -117.1611 }, // San Diego
-  { lat: 38.5816, lon: -121.4944 }, // Sacramento
-];
-/** TfL JamCams: one keyless list endpoint; frames live on a public S3 bucket. */
-const TFL_JAMCAM_URL = 'https://api.tfl.gov.uk/Place/Type/JamCam';
-const TFL_IMAGE_ORIGIN = 'https://s3-eu-west-1.amazonaws.com/jamcams.tfl.gov.uk/';
-const DEFAULT_TFL_MAX_SOURCES = 250;
-const LONDON_CENTER = { lat: 51.5074, lon: -0.1278 };
-/** Camera CATALOGS change rarely; 15 min keeps multi-megabyte upstream list refetches (Austin rows.json + 4 Caltrans districts + TfL) infrequent. Frames are fetched per-request and are unaffected. */
+/** Windy Webcams API v3. Keyed: `x-windy-api-key` on every request. */
+const WINDY_WEBCAMS_API = 'https://api.windy.com/webcams/api/v3/webcams';
+/** Hosts a Windy webcam *page* URL may name — the required attribution link. */
+const WINDY_PAGE_HOSTS = new Set(['www.windy.com', 'windy.com']);
+/** Host serving the timelapse player embeds. Verified 2026-09-04 to send no
+ * X-Frame-Options and no CSP frame-ancestors, so it is genuinely embeddable —
+ * and embedding is the integration Windy's own terms point at. */
+const WINDY_PLAYER_HOSTS = new Set(['webcams.windy.com']);
+/** Timelapse ranges Windy exposes, coarsest last. These are the scrub windows. */
+const WINDY_PLAYER_RANGES = Object.freeze(['day', 'month', 'year', 'lifetime']);
+/** Hosts a Windy image URL may name. The resolver reads these URLs out of a
+ * third-party JSON body, so the host is untrusted until it matches this set —
+ * the same origin pin TfL's public S3 bucket had. */
+const WINDY_IMAGE_HOSTS = new Set([
+  // Verified against a live v3 response 2026-09-04: free-tier current/preview
+  // images are served from imgproxy. The others are documented alternates kept
+  // as a hedge — an unlisted host silently costs every frame, so widen this
+  // set (and re-verify) rather than loosening the check to a suffix match.
+  'imgproxy.windy.com',
+  'images-webcams.windy.com',
+  'images.windy.com',
+]);
+/** Windy's docs warn that image URLs can be token-signed and expire (10 min
+ * free / 24 h pro). Verified 2026-09-04, this tier returns UNSIGNED, stable
+ * URLs (`.../current/original.jpg?v=2`), so there is nothing to refresh on a
+ * timer — a proactive TTL would have cost one API call per camera per window
+ * for no gain. Refresh is therefore failure-driven: an expired or rotated URL
+ * fails its image fetch, and /frame/ forces one re-resolve, which self-heals
+ * the signed case too. Cache entries are last-known-good, not time-boxed. */
+/** Bounds the resolver cache the way HEALTH_MAX_ENTRIES bounds health. */
+const WINDY_IMAGE_CACHE_MAX = 1200;
+/** Windy caps `limit` at 50 per page and `offset` at 1000 on the free tier. */
+const WINDY_PAGE_LIMIT = 50;
+const WINDY_MAX_OFFSET = 1000;
+/** One page per anchor by default: 20 anchors x 50 = 1,000 candidates, which
+ * already exceeds the 900 global cap. Raise only with a narrowed anchor set. */
+const DEFAULT_WINDY_PAGES_PER_ANCHOR = 1;
+/** Parallel catalog requests. The free tier rate-limits a 20-request burst. */
+const WINDY_FETCH_CONCURRENCY = 4;
+const DEFAULT_WINDY_MAX_SOURCES = 900;
+/** Default worldwide anchor sweep as `lat,lon,radiusKm` triples. Bucharest
+ * leads because it is this fork's primary area of interest; the rest spread
+ * the cap across dense-webcam metros on every inhabited continent. Override
+ * wholesale with CCTV_WINDY_ANCHORS to re-aim the network without a code change. */
+const DEFAULT_WINDY_ANCHORS = [
+  '44.4268,26.1025,90',   // Bucharest
+  '45.6579,25.6012,90',   // Brasov / Carpathians
+  '47.1585,27.6014,90',   // Iasi
+  '51.5074,-0.1278,60',   // London
+  '48.8566,2.3522,60',    // Paris
+  '52.5200,13.4050,60',   // Berlin
+  '41.9028,12.4964,60',   // Rome
+  '40.4168,-3.7038,60',   // Madrid
+  '46.8182,8.2275,90',    // Swiss Alps
+  '41.0082,28.9784,60',   // Istanbul
+  '59.3293,18.0686,60',   // Stockholm
+  '64.1466,-21.9426,90',  // Reykjavik
+  '40.7128,-74.0060,60',  // New York
+  '37.7749,-122.4194,60', // San Francisco
+  '34.0522,-118.2437,60', // Los Angeles
+  '25.7617,-80.1918,60',  // Miami
+  '35.6762,139.6503,60',  // Tokyo
+  '1.3521,103.8198,60',   // Singapore
+  '-33.8688,151.2093,60', // Sydney
+  // Sparse regions need the full 250 km radius: Rio returns ZERO webcams at
+  // 60 km and 11 at 250. A tight radius there is indistinguishable from an
+  // outage — verify a new anchor actually returns rows before adding it.
+  '-22.9068,-43.1729,250', // Rio de Janeiro
+  '-23.5505,-46.6333,250', // Sao Paulo
+  '-33.9249,18.4241,250',  // Cape Town
+].join(';');
+/** @type {Map<string,{url:string,at:number}>} Windy image URL resolver cache. */
+const _windyImageUrlCache = new Map();
+/** Camera CATALOGS change rarely; 15 min keeps the anchored Windy sweep
+ * (one request per anchor) infrequent. Frames are fetched per-request and are
+ * unaffected — note that Windy image URLs expire well inside this window, which
+ * is exactly why resolveWindySnapshotUrl() exists. */
 const CCTV_SOURCE_CACHE_MS = 15 * 60 * 1000;
 /** Per-provider catalog-fetch timeout. Bounds the worst-case refresh so one
  * stalled upstream can't leave getCctvSources (and thus every CCTV route)
@@ -3527,19 +3579,6 @@ function toFiniteNumber(value, fallback = NaN) {
   return Number.isFinite(num) ? num : fallback;
 }
 
-/**
- * Normalize a column/field name to a lowercase snake_case key.
- *
- * @param {string} text
- * @returns {string}
- */
-function normalizeKey(text) {
-  return String(text || '')
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '_')
-    .replace(/^_+|_+$/g, '');
-}
 
 /**
  * Load CCTV sources from a local JSON file (CCTV_SOURCES_FILE env or default).
@@ -3577,203 +3616,6 @@ function loadSourcesFromEnv() {
     return [];
   }
 }
-
-
-/**
- * Parse a WKT POINT string (e.g. "POINT(-97.74 30.27)") into lat/lon.
- *
- * WKT uses (lon lat) order; returned object uses {lat, lon}.
- *
- * @param {string} value
- * @returns {{lat:number, lon:number}}
- */
-function parsePointString(value) {
-  const match = String(value || '').match(/POINT\s*\(\s*(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s*\)/i);
-  if (!match) return { lat: NaN, lon: NaN };
-  return {
-    lon: toFiniteNumber(match[1]),
-    lat: toFiniteNumber(match[2]),
-  };
-}
-
-/**
- * Extract lat/lon from a variety of coordinate representations.
- *
- * Handles WKT POINT strings, and objects with latitude/lat/y or
- * longitude/lon/lng/x properties (various casing).
- *
- * @param {string|object|null} value
- * @returns {{lat:number, lon:number}}
- */
-function coerceLatLon(value) {
-  if (!value) return { lat: NaN, lon: NaN };
-
-  if (typeof value === 'string') {
-    return parsePointString(value);
-  }
-
-  if (typeof value !== 'object') {
-    return { lat: NaN, lon: NaN };
-  }
-
-  const lat = toFiniteNumber(
-    value.latitude ?? value.lat ?? value.y ?? value.Latitude ?? value.Lat,
-    NaN
-  );
-  const lon = toFiniteNumber(
-    value.longitude ?? value.lon ?? value.lng ?? value.x ?? value.Longitude ?? value.Lon,
-    NaN
-  );
-  return { lat, lon };
-}
-
-/**
- * Extract geographic coordinates from an Austin Open Data camera record.
- *
- * Tries several candidate fields (location, coordinates, the_geom,
- * point, geocoded_column) via coerceLatLon, then falls back to
- * explicit latitude/longitude scalar fields.
- *
- * @param {object} record - Flattened camera record.
- * @returns {{lat:number, lon:number}}
- */
-function extractAustinCoords(record) {
-  const candidates = [
-    record.location,
-    record.coordinates,
-    record.the_geom,
-    record.point,
-    record.geocoded_column,
-  ];
-  for (const candidate of candidates) {
-    const parsed = coerceLatLon(candidate);
-    if (Number.isFinite(parsed.lat) && Number.isFinite(parsed.lon)) return parsed;
-  }
-
-  const lat = toFiniteNumber(
-    record.latitude ?? record.lat ?? record.camera_latitude ?? record.location_latitude,
-    NaN
-  );
-  const lon = toFiniteNumber(
-    record.longitude ?? record.lon ?? record.lng ?? record.camera_longitude ?? record.location_longitude,
-    NaN
-  );
-  return { lat, lon };
-}
-
-/**
- * Extract a numeric camera ID from an Austin Open Data record.
- *
- * Tries well-known field names first, then scans any field whose key
- * contains "camera"/"cam"/"device" + "id".
- *
- * @param {object} record - Flattened camera record.
- * @returns {string} Numeric ID string, or '' if none found.
- */
-function extractAustinCameraId(record) {
-  const preferredKeys = [
-    'camera_id',
-    'cameraid',
-    'cam_id',
-    'device_id',
-    'intersection_id',
-    'id',
-  ];
-  for (const key of preferredKeys) {
-    const value = record[key];
-    if (value == null) continue;
-    const asText = String(value).trim();
-    if (!asText) continue;
-    if (/^\d+$/.test(asText)) return asText;
-  }
-
-  for (const [key, value] of Object.entries(record)) {
-    if (!/camera|cam|device/.test(key)) continue;
-    if (!/id/.test(key)) continue;
-    const asText = String(value || '').trim();
-    if (!asText) continue;
-    if (/^\d+$/.test(asText)) return asText;
-  }
-
-  return '';
-}
-
-/**
- * Extract a human-readable camera name from an Austin record.
- *
- * @param {object} record - Flattened camera record.
- * @param {string} cameraId - Fallback identifier if no name field found.
- * @returns {string}
- */
-function extractAustinName(record, cameraId) {
-  const preferredKeys = [
-    'camera_name',
-    'location_name',
-    'intersection_name',
-    'location',
-    'cross_street',
-    'description',
-    'name',
-  ];
-  for (const key of preferredKeys) {
-    const value = record[key];
-    if (typeof value !== 'string') continue;
-    const text = value.trim();
-    if (text) return text;
-  }
-  return `Austin Camera ${cameraId}`;
-}
-
-/**
- * Extract camera heading (compass bearing) from an Austin record.
- *
- * Tries explicit numeric heading fields first, then direction-keyword
- * fields, then infers from the camera name/description text.
- *
- * @param {object} record - Flattened camera record.
- * @returns {number} Heading in degrees [0..360), or NaN if unknown.
- */
-function extractAustinHeading(record) {
-  const direct = toFiniteNumber(record.heading_deg ?? record.heading ?? record.bearing, NaN);
-  if (Number.isFinite(direct)) return ((direct % 360) + 360) % 360;
-
-  // Dedicated direction fields: bare cardinal words ("West") are real facings.
-  const directionKeys = ['direction', 'travel_direction', 'facing', 'facing_direction'];
-  for (const key of directionKeys) {
-    const heading = directionToHeading(record[key], true);
-    if (Number.isFinite(heading)) return heading;
-  }
-
-  // Free-form name/intersection text: only explicit travel forms ("WESTBOUND"/
-  // "WB") count — a bare "West" here is a street name ("5TH ST / WEST AVE"), not
-  // a facing, and must not promote the camera to a false high-confidence heading.
-  const nameProbe = [
-    record.camera_name,
-    record.location_name,
-    record.intersection_name,
-    record.location,
-    record.cross_street,
-    record.description,
-    record.name,
-  ].filter(Boolean).join(' ');
-  const inferred = directionToHeading(nameProbe);
-  if (Number.isFinite(inferred)) return inferred;
-
-  return NaN;
-}
-
-/**
- * Bounding-box sanity check: is this coordinate plausibly in the Austin metro area?
- *
- * @param {number} lat
- * @param {number} lon
- * @returns {boolean}
- */
-function isLikelyAustinCoordinate(lat, lon) {
-  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return false;
-  return lat >= 30.02 && lat <= 30.58 && lon >= -98.12 && lon <= -97.40;
-}
-
 /**
  * Derive a deterministic fallback heading from a camera ID hash.
  *
@@ -3786,23 +3628,6 @@ function fallbackHeadingFromId(cameraId) {
   return (hashSeed(String(cameraId)) % 16) * 22.5;
 }
 
-/**
- * Convert a Socrata rows.json array row into a keyed object using column metadata.
- *
- * @param {Array} row - Array of cell values from the Socrata payload.
- * @param {Array<{fieldName?:string, name?:string}>} columns - Column descriptors.
- * @returns {object} Keyed record with normalized snake_case keys.
- */
-function rowArrayToObject(row, columns) {
-  const record = {};
-  for (let idx = 0; idx < columns.length; idx++) {
-    const col = columns[idx];
-    const key = normalizeKey(col.fieldName || col.name || `col_${idx}`);
-    if (!key) continue;
-    record[key] = row[idx];
-  }
-  return record;
-}
 
 /**
  * Haversine great-circle distance between two WGS-84 points.
@@ -3861,264 +3686,363 @@ function prioritizeSources(cameras, maxCount, anchors) {
 }
 
 /**
- * Fetch and parse Austin traffic camera records from the city Open Data portal.
+ * Parse the Windy anchor spec: `lat,lon,radiusKm` triples separated by `;`.
+ * Malformed triples are skipped rather than failing the pack — a typo in one
+ * anchor must not blank worldwide CCTV coverage.
  *
- * Downloads the Socrata rows.json payload, converts each row to a keyed
- * record, extracts camera ID / coords / heading / name, validates against
- * the Austin bounding box, deduplicates by ID, then distance-prioritizes
- * to stay within CCTV_AUSTIN_MAX_SOURCES.
- *
- * @returns {Promise<Array<object>>} Normalized camera source objects.
+ * @param {string} spec
+ * @returns {Array<{lat:number,lon:number,radiusKm:number}>}
  */
-async function loadAustinSourcesFromOpenData() {
-  const endpoint = process.env.CCTV_AUSTIN_ROWS_URL || DEFAULT_AUSTIN_ROWS_URL;
+export function parseWindyAnchors(spec) {
+  const out = [];
+  for (const chunk of String(spec || '').split(';')) {
+    const parts = chunk.split(',').map((p) => Number(p.trim()));
+    if (parts.length < 2) continue;
+    const [lat, lon, radiusKm] = parts;
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+    if (Math.abs(lat) > 90 || Math.abs(lon) > 180) continue;
+    // Windy caps the `nearby` radius at 250 km; clamp rather than let it 400.
+    const radius = Number.isFinite(radiusKm) ? Math.max(5, Math.min(250, radiusKm)) : 60;
+    out.push({ lat, lon, radiusKm: radius });
+  }
+  return out;
+}
+
+/**
+ * Origin pin for Windy image URLs — the same control TfL's S3-bucket check
+ * applied. The resolver reads a URL out of a third-party JSON body, so the
+ * host it names is untrusted input until it matches this allowlist.
+ *
+ * @param {string} candidate
+ * @returns {boolean}
+ */
+export function isPinnedWindyImageUrl(candidate) {
+  if (typeof candidate !== 'string' || !candidate) return false;
   try {
-    const resp = await fetch(endpoint, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(CCTV_SOURCE_FETCH_TIMEOUT_MS) });
-    if (!resp.ok) {
-      console.warn('[CCTV] Austin source download failed:', resp.status);
-      return [];
-    }
-    const payload = await resp.json();
-    const columns = Array.isArray(payload?.meta?.view?.columns) ? payload.meta.view.columns : [];
-    const rows = Array.isArray(payload?.data) ? payload.data : [];
-    if (!columns.length || !rows.length) return [];
-
-    const cameras = [];
-    for (const row of rows) {
-      if (!Array.isArray(row)) continue;
-      const record = rowArrayToObject(row, columns);
-      const cameraId = extractAustinCameraId(record);
-      if (!cameraId) continue;
-
-      // Only live cameras: the dataset carries DESIRED (planned, not built),
-      // REMOVED and VOID rows whose frame URLs never resolve — those cameras
-      // would render as permanent Street View / synthetic fallbacks. Tolerate
-      // a missing column (keep the row) so a schema change fails open.
-      const status = String(record.camera_status || '').trim().toUpperCase();
-      if (status && status !== 'TURNED_ON') continue;
-
-      const { lat, lon } = extractAustinCoords(record);
-      if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
-      if (!isLikelyAustinCoordinate(lat, lon)) continue;
-
-      const extractedHeading = extractAustinHeading(record);
-      const hasHeading = Number.isFinite(extractedHeading);
-      const headingDeg = hasHeading ? extractedHeading : fallbackHeadingFromId(cameraId);
-      cameras.push({
-        id: cameraId,
-        name: extractAustinName(record, cameraId),
-        city: 'Austin',
-        cityId: 'austin',
-        provider: 'Austin Transportation & Public Works',
-        lat,
-        lon,
-        headingDeg,
-        headingConfidence: hasHeading ? 'high' : 'low',
-        pitchDeg: hasHeading ? -24 : -18,
-        fovDeg: hasHeading ? 56 : 44,
-        rangeM: hasHeading ? 210 : 145,
-        mountHeightM: hasHeading ? 10 : 8,
-        groundElevationM: 150,
-        feedType: 'image',
-        url: `https://cctv.austinmobility.io/image/${encodeURIComponent(cameraId)}.jpg`,
-        snapshotUrl: `https://cctv.austinmobility.io/image/${encodeURIComponent(cameraId)}.jpg`,
-        sourceKind: 'austin-open-data',
-        license: 'Public city traffic camera frame',
-      });
-    }
-
-    const unique = Array.from(new Map(cameras.map((camera) => [camera.id, camera])).values());
-    const maxRaw = Number(process.env.CCTV_AUSTIN_MAX_SOURCES || DEFAULT_AUSTIN_MAX_SOURCES);
-    const maxCount = Number.isFinite(maxRaw) ? Math.max(8, Math.min(300, Math.floor(maxRaw))) : DEFAULT_AUSTIN_MAX_SOURCES;
-    const prioritized = prioritizeSources(unique, maxCount, [AUSTIN_DOWNTOWN]);
-    if (prioritized.length < unique.length) {
-      console.log(`[CCTV] Loaded Austin camera sources: ${unique.length} (using nearest ${prioritized.length})`);
-    } else {
-      console.log('[CCTV] Loaded Austin camera sources:', prioritized.length);
-    }
-    return prioritized;
-  } catch (error) {
-    console.warn('[CCTV] Austin source download error:', error?.message || error);
-    return [];
+    const parsed = new URL(candidate);
+    if (parsed.protocol !== 'https:') return false;
+    return WINDY_IMAGE_HOSTS.has(parsed.hostname);
+  } catch {
+    return false;
   }
 }
 
 /**
- * Fetch Caltrans CCTV cameras for the configured districts (CCTV_CALTRANS_DISTRICTS,
- * comma-separated 1..12; empty string disables the pack). One official JSON feed per
- * district, identical schema statewide; keyless. Only inService cameras with finite
- * coords and a cwwp2.dot.ca.gov https image URL are kept (the image-URL origin check
- * is defense-in-depth: the proxy only ever fetches catalog URLs, and this pins the
- * catalog to the official host). Districts fetch in parallel and fail independently
- * (Promise.allSettled) — one district outage never darkens the others.
+ * Pin the webcam's public detail page — the link Windy's terms require beside
+ * every displayed frame. Same untrusted-URL treatment as the image host.
+ *
+ * @param {object} webcam
+ * @returns {string}
+ */
+export function pickWindyDetailUrl(webcam) {
+  const candidate = webcam?.urls?.detail;
+  if (typeof candidate !== 'string' || !candidate) return '';
+  try {
+    const parsed = new URL(candidate);
+    if (parsed.protocol !== 'https:') return '';
+    return WINDY_PAGE_HOSTS.has(parsed.hostname) ? candidate : '';
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Pin the timelapse player embeds — the only way Windy exposes a webcam's
+ * history. There is no frame-level archive API, so scrubbing through time
+ * means their player or nothing.
+ *
+ * @param {object} webcam
+ * @returns {Record<string,string>} Range -> embed URL, omitting anything unpinned.
+ */
+function pickWindyPlayerUrls(webcam) {
+  const player = webcam?.player || {};
+  const out = {};
+  for (const range of WINDY_PLAYER_RANGES) {
+    const candidate = player[range];
+    if (typeof candidate !== 'string' || !candidate) continue;
+    try {
+      const parsed = new URL(candidate);
+      if (parsed.protocol !== 'https:') continue;
+      if (!WINDY_PLAYER_HOSTS.has(parsed.hostname)) continue;
+      out[range] = candidate;
+    } catch { /* skip an unparseable entry, keep the rest */ }
+  }
+  return out;
+}
+
+/**
+ * Extract the largest usable still URL from a Windy webcam record, preferring
+ * `preview` (the largest size the free tier returns) and falling back through
+ * thumbnail and icon. Returns '' when nothing passes the origin pin.
+ *
+ * @param {object} webcam
+ * @returns {string}
+ */
+export function pickWindyImageUrl(webcam) {
+  const current = webcam?.images?.current || {};
+  const candidates = [current.preview, current.thumbnail, current.icon];
+  for (const candidate of candidates) {
+    if (isPinnedWindyImageUrl(candidate)) return candidate;
+  }
+  // A camera with images that ALL failed the pin means Windy moved hosts —
+  // otherwise this is indistinguishable from a camera with no images at all,
+  // and the whole catalog would go frameless with nothing in the log.
+  if (candidates.some((c) => typeof c === 'string' && c)) {
+    console.warn('[CCTV] Windy image URL rejected by the host pin:', candidates.find((c) => c));
+  }
+  return '';
+}
+
+/**
+ * Resolve a currently-valid Windy image URL for one webcam.
+ *
+ * This is the ONLY sanctioned reader of a Windy image URL at frame-serve time
+ * — do not reintroduce a direct `source.snapshotUrl` read for Windy rows. On
+ * the verified free tier those URLs are stable, but Windy documents a signed
+ * variant that expires (10 min free / 24 h pro) and then answers 401, and the
+ * catalog cache (15 min) outlives that window. Routing every Windy frame
+ * through here is what makes both cases behave identically.
+ *
+ * The cache holds the last-known-good URL with no expiry of its own; `force`
+ * is what replaces one, and /frame/ sets it after a failed image fetch.
+ *
+ * @param {string|number} webcamId
+ * @param {string} [seedUrl] - URL captured during the catalog build, if fresh.
+ * @param {object} [options]
+ * @param {boolean} [options.force=false] - Ignore the cache (post-401 retry).
+ * @param {typeof fetch} [options.fetchImpl=fetch] - Injected for tests.
+ * @returns {Promise<string>} A pinned Windy image URL, or '' when unavailable.
+ */
+export async function resolveWindySnapshotUrl(webcamId, seedUrl = '', {
+  force = false,
+  fetchImpl = fetch,
+} = {}) {
+  const key = String(webcamId || '').trim();
+  if (!key) return '';
+  if (!force) {
+    const cached = _windyImageUrlCache.get(key);
+    if (cached?.url) return cached.url;
+    if (seedUrl && isPinnedWindyImageUrl(seedUrl)) {
+      _windyImageUrlCache.set(key, { url: seedUrl, at: Date.now() });
+      return seedUrl;
+    }
+  }
+
+  const apiKey = String(process.env.WINDY_WEBCAMS_API_KEY || '').trim();
+  if (!apiKey) return '';
+  try {
+    const url = `${WINDY_WEBCAMS_API}/${encodeURIComponent(key)}?include=images`;
+    const resp = await fetchImpl(url, {
+      headers: { 'x-windy-api-key': apiKey, Accept: 'application/json' },
+      signal: AbortSignal.timeout(CCTV_FRAME_FETCH_TIMEOUT_MS),
+    });
+    if (!resp.ok) return '';
+    const payload = await resp.json();
+    const fresh = pickWindyImageUrl(payload?.webcam || payload);
+    if (!fresh) return '';
+    // Bound the cache the same way the health map is bounded.
+    if (!_windyImageUrlCache.has(key) && _windyImageUrlCache.size >= WINDY_IMAGE_CACHE_MAX) {
+      _windyImageUrlCache.delete(_windyImageUrlCache.keys().next().value);
+    }
+    _windyImageUrlCache.set(key, { url: fresh, at: Date.now() });
+    return fresh;
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Fetch one anchored page of the Windy network.
+ *
+ * @param {{lat:number,lon:number,radiusKm:number}} anchor
+ * @param {number} offset
+ * @param {string} apiKey
+ * @returns {Promise<Array<object>>} Raw Windy webcam records.
+ */
+async function fetchWindyPage(anchor, offset, apiKey) {
+  const params = new URLSearchParams({
+    nearby: `${anchor.lat},${anchor.lon},${Math.round(anchor.radiusKm)}`,
+    limit: String(WINDY_PAGE_LIMIT),
+    offset: String(offset),
+    // `urls` is not cosmetic: Windy's API terms require every displayed image
+    // to link back to its webcam page, so detail is part of the minimum record.
+    // `player` carries the timelapse embeds the CCTV panel scrubs through.
+    include: 'location,images,urls,player',
+    lang: 'en',
+  });
+  const resp = await fetch(`${WINDY_WEBCAMS_API}?${params}`, {
+    headers: { 'x-windy-api-key': apiKey, Accept: 'application/json' },
+    signal: AbortSignal.timeout(CCTV_SOURCE_FETCH_TIMEOUT_MS),
+  });
+  if (!resp.ok) {
+    console.warn(`[CCTV] Windy page failed (${anchor.lat},${anchor.lon} +${offset}):`, resp.status);
+    return [];
+  }
+  const payload = await resp.json();
+  return Array.isArray(payload?.webcams) ? payload.webcams : [];
+}
+
+/**
+ * Read one Windy coordinate field.
+ *
+ * NOT toFiniteNumber: Number(null) is 0, so a row with a null latitude would
+ * coerce to a finite 0 and render a camera in the Gulf of Guinea instead of
+ * being dropped. Windy leaves coordinates null on unlocated webcams.
+ *
+ * @param {*} value
+ * @returns {number} The coordinate, or NaN when absent/unparseable.
+ */
+function readWindyCoord(value) {
+  if (value === null || value === undefined || value === '') return NaN;
+  const num = Number(value);
+  return Number.isFinite(num) ? num : NaN;
+}
+
+/**
+ * Normalize one raw Windy webcam record into a CCTV source row.
+ * Returns null for rows that cannot be rendered honestly.
+ *
+ * @param {object} webcam
+ * @returns {object|null}
+ */
+export function windyWebcamToSource(webcam) {
+  const webcamId = String(webcam?.webcamId ?? '').trim();
+  if (!webcamId) return null;
+  // Windy marks retired/offline cameras `inactive`; their image URLs still
+  // resolve, to a stale last-known frame — which would render as live
+  // surveillance. Tolerate a missing status so a schema change fails open.
+  const status = String(webcam?.status || '').trim().toLowerCase();
+  if (status && status !== 'active') return null;
+
+  const lat = readWindyCoord(webcam?.location?.latitude);
+  const lon = readWindyCoord(webcam?.location?.longitude);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+  if (Math.abs(lat) > 90 || Math.abs(lon) > 180) return null;
+
+  const cameraId = `windy-${webcamId}`;
+  // Windy returns city/region/country on include=location. The panel shows a
+  // single place string, so compose the most specific pair available rather
+  // than dropping to the 'Global' fallback whenever a city name is missing.
+  const cityName = String(webcam?.location?.city || '').trim();
+  const country = String(webcam?.location?.country || '').trim();
+  const city = [cityName, country].filter(Boolean).join(', ');
+  return {
+    id: cameraId,
+    name: String(webcam?.title || city || `Windy webcam ${webcamId}`),
+    city,
+    cityId: '',
+    provider: 'Windy Webcams',
+    lat,
+    lon,
+    // Windy carries no orientation signal at all — the same situation as TfL
+    // JamCams. An id-hash prior keeps every frustum from pointing north; the
+    // low confidence is what drives the panel's RAW PRIOR badge.
+    headingDeg: fallbackHeadingFromId(cameraId),
+    headingConfidence: 'low',
+    pitchDeg: -12,
+    fovDeg: 60,
+    rangeM: 320,
+    mountHeightM: 12,
+    groundElevationM: NaN,
+    feedType: 'image',
+    // `snapshotUrl` is a SEED, not the frame-serve URL: it expires in 10 min.
+    // `windyWebcamId` is the durable handle and resolveWindySnapshotUrl() is
+    // what /frame/ actually reads.
+    url: '',
+    snapshotUrl: pickWindyImageUrl(webcam),
+    windyWebcamId: webcamId,
+    // Required attribution target (Windy API terms). A row without one still
+    // renders — the panel just omits the link rather than inventing a URL.
+    detailUrl: pickWindyDetailUrl(webcam),
+    playerUrls: pickWindyPlayerUrls(webcam),
+    sourceKind: 'windy-webcams',
+    license: 'Windy Webcams API — frames link back to windy.com',
+  };
+}
+
+/**
+ * Load the Windy Webcams network as the CCTV catalog.
+ *
+ * Windy publishes tens of thousands of cameras worldwide; the proxy ceiling is
+ * CCTV_MAX_SOURCES (900 default, 1200 hard). A plain paged sweep of `/webcams`
+ * would return an arbitrary id-ordered slice biased toward the oldest cameras,
+ * so the pack runs one `nearby` query per configured anchor and prioritizes
+ * the union against those same anchors — the Caltrans/TfL pattern, widened to
+ * world metros. Anchors are overridable end-to-end via CCTV_WINDY_ANCHORS so
+ * the network can be re-aimed without a code change.
+ *
+ * Requires WINDY_WEBCAMS_API_KEY. Without it the pack returns [] and the CCTV
+ * layer reports an honest empty catalog rather than a green ON over nothing.
  *
  * @returns {Promise<Array<object>>} Normalized camera source objects.
  */
-async function loadCaltransSourcesFromOpenData() {
-  const districtsRaw = process.env.CCTV_CALTRANS_DISTRICTS ?? DEFAULT_CALTRANS_DISTRICTS;
-  const districts = String(districtsRaw)
-    .split(',')
-    .map((token) => Number(token.trim()))
-    .filter((n) => Number.isInteger(n) && n >= 1 && n <= 12);
-  if (!districts.length) return [];
+async function loadWindySourcesFromApi() {
+  const apiKey = String(process.env.WINDY_WEBCAMS_API_KEY || '').trim();
+  if (!apiKey) {
+    console.warn('[CCTV] WINDY_WEBCAMS_API_KEY is not set — CCTV catalog is empty.');
+    return [];
+  }
 
-  const settled = await Promise.allSettled(
-    districts.map(async (district) => {
-      const resp = await fetch(CALTRANS_CCTV_URL(district), { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(CCTV_SOURCE_FETCH_TIMEOUT_MS) });
-      if (!resp.ok) throw new Error(`D${district} HTTP ${resp.status}`);
-      const payload = await resp.json();
-      const rows = Array.isArray(payload?.data) ? payload.data : [];
-      return { district, rows };
-    })
+  const anchors = parseWindyAnchors(process.env.CCTV_WINDY_ANCHORS || DEFAULT_WINDY_ANCHORS);
+  if (!anchors.length) {
+    console.warn('[CCTV] CCTV_WINDY_ANCHORS parsed to zero anchors — CCTV catalog is empty.');
+    return [];
+  }
+
+  const pagesRaw = Number(process.env.CCTV_WINDY_PAGES_PER_ANCHOR || DEFAULT_WINDY_PAGES_PER_ANCHOR);
+  // The free tier caps offset at 1000; pages past that 400 for no gain.
+  const pageCeiling = Math.floor(WINDY_MAX_OFFSET / WINDY_PAGE_LIMIT);
+  const maxPages = Number.isFinite(pagesRaw)
+    ? Math.max(1, Math.min(pageCeiling, Math.floor(pagesRaw)))
+    : DEFAULT_WINDY_PAGES_PER_ANCHOR;
+
+  const jobs = [];
+  for (const anchor of anchors) {
+    for (let page = 0; page < maxPages; page += 1) {
+      jobs.push({ anchor, offset: page * WINDY_PAGE_LIMIT });
+    }
+  }
+
+  // Bounded concurrency: 20 default anchors x N pages is a burst the free tier
+  // will rate-limit if fired at once. Failures are per-request, never fatal.
+  const raw = [];
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < jobs.length) {
+      const job = jobs[cursor];
+      cursor += 1;
+      try {
+        raw.push(...await fetchWindyPage(job.anchor, job.offset, apiKey));
+      } catch (error) {
+        console.warn('[CCTV] Windy page error:', error?.message || error);
+      }
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(WINDY_FETCH_CONCURRENCY, jobs.length) }, worker)
   );
 
   const cameras = [];
-  for (const result of settled) {
-    if (result.status !== 'fulfilled') {
-      console.warn('[CCTV] Caltrans district fetch failed:', result.reason?.message || result.reason);
-      continue;
+  const seedAt = Date.now();
+  for (const webcam of raw) {
+    const source = windyWebcamToSource(webcam);
+    if (!source) continue;
+    // Seed the resolver so the first frame of a freshly-built catalog does not
+    // pay a per-camera round trip.
+    if (source.snapshotUrl) {
+      _windyImageUrlCache.set(source.windyWebcamId, { url: source.snapshotUrl, at: seedAt });
     }
-    const { district, rows } = result.value;
-    for (const row of rows) {
-      const cctv = row?.cctv;
-      if (!cctv || String(cctv.inService).toLowerCase() !== 'true') continue;
-      const loc = cctv.location || {};
-      const lat = toFiniteNumber(loc.latitude);
-      const lon = toFiniteNumber(loc.longitude);
-      if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
-
-      const imageUrl = String(cctv.imageData?.static?.currentImageURL || '');
-      // Official-host pin (see JSDoc). Also drops records with no still image.
-      if (!imageUrl.startsWith('https://cwwp2.dot.ca.gov/')) continue;
-
-      const locationName = String(loc.locationName || '').trim();
-      // Leading token of locationName is the stable camera code ("TV102 -- I-580 : …").
-      const codeMatch = /^([A-Za-z0-9_-]+)\s*--/.exec(locationName);
-      const code = (codeMatch ? codeMatch[1] : `x${cameras.length}`).toLowerCase();
-      const cameraId = `ca-d${district}-${code}`;
-
-      // loc.direction is a dedicated field ("West", "South") → allow bare words.
-      const heading = directionToHeading(loc.direction, true);
-      const hasHeading = Number.isFinite(heading);
-      const label = locationName.replace(/^([A-Za-z0-9_-]+)\s*--\s*/, '') || `Caltrans D${district} ${code}`;
-      cameras.push({
-        id: cameraId,
-        name: loc.nearbyPlace ? `${label} (${loc.nearbyPlace})` : label,
-        city: String(loc.nearbyPlace || `Caltrans D${district}`),
-        cityId: `ca-d${district}`,
-        provider: 'Caltrans',
-        lat,
-        lon,
-        headingDeg: hasHeading ? heading : fallbackHeadingFromId(cameraId),
-        headingConfidence: hasHeading ? 'high' : 'low',
-        // Same two fabricated pose personalities as Austin (design §1a): these are
-        // RAW PRIOR starting points; the client's one-shot ground snap + manual
-        // calibration own the truth.
-        pitchDeg: hasHeading ? -24 : -18,
-        fovDeg: hasHeading ? 56 : 44,
-        rangeM: hasHeading ? 210 : 145,
-        mountHeightM: hasHeading ? 10 : 8,
-        // loc.elevation is reported in FEET (verified: D3 maxes at 7427 ft ≈
-        // 2264 m for the Sierra passes — as metres that would top Mt Whitney).
-        // Convert to metres and clamp to a sane CA-roads range so an occasional
-        // garbage upstream value can't fling a camera kilometres up. Prior only:
-        // the client one-shot snap corrects it on 3D-tile stacks — but on a
-        // no-tileset stack (keyless OSM) the snap misses and this height freezes,
-        // so it must be right-ish on its own.
-        groundElevationM: (() => {
-          const ft = toFiniteNumber(loc.elevation, NaN);
-          return Number.isFinite(ft) ? Math.max(-100, Math.min(4000, ft * 0.3048)) : 150;
-        })(),
-        feedType: 'image',
-        url: imageUrl,
-        snapshotUrl: imageUrl,
-        sourceKind: 'caltrans-open-data',
-        license: 'Public Caltrans highway camera frame',
-      });
-    }
+    cameras.push(source);
   }
 
-  const maxRaw = Number(process.env.CCTV_CALTRANS_MAX_SOURCES || DEFAULT_CALTRANS_MAX_SOURCES);
-  const maxCount = Number.isFinite(maxRaw) ? Math.max(8, Math.min(600, Math.floor(maxRaw))) : DEFAULT_CALTRANS_MAX_SOURCES;
-  const prioritized = prioritizeSources(cameras, maxCount, CALTRANS_ANCHORS);
-  console.log(`[CCTV] Loaded Caltrans camera sources: ${cameras.length} inService (using nearest ${prioritized.length})`);
+  const unique = Array.from(new Map(cameras.map((camera) => [camera.id, camera])).values());
+  const maxRaw = Number(process.env.CCTV_WINDY_MAX_SOURCES || DEFAULT_WINDY_MAX_SOURCES);
+  const maxCount = Number.isFinite(maxRaw)
+    ? Math.max(8, Math.min(1200, Math.floor(maxRaw)))
+    : DEFAULT_WINDY_MAX_SOURCES;
+  const prioritized = prioritizeSources(unique, maxCount, anchors);
+  console.log(`[CCTV] Loaded Windy webcam sources: ${unique.length} across ${anchors.length} anchors (using nearest ${prioritized.length})`);
   return prioritized;
-}
-
-/**
- * Fetch TfL JamCams (London). Keyless: the optional TFL_APP_KEY only raises the
- * list-endpoint rate limit (frames come from TfL's public S3 bucket, which is not
- * rate-limited); the 15-min source cache keeps list hits far below anonymous
- * limits anyway. Only `available === "true"` cameras with finite coords and an
- * image URL on the official bucket are kept. Attribution: "Powered by TfL Open
- * Data" (registered in src/data/dataCredits.js).
- *
- * @returns {Promise<Array<object>>} Normalized camera source objects.
- */
-async function loadTflSourcesFromOpenData() {
-  try {
-    const appKey = String(process.env.TFL_APP_KEY || '').trim();
-    const url = appKey ? `${TFL_JAMCAM_URL}?app_key=${encodeURIComponent(appKey)}` : TFL_JAMCAM_URL;
-    const resp = await fetch(url, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(CCTV_SOURCE_FETCH_TIMEOUT_MS) });
-    if (!resp.ok) {
-      console.warn('[CCTV] TfL JamCam download failed:', resp.status);
-      return [];
-    }
-    const places = await resp.json();
-    if (!Array.isArray(places)) return [];
-
-    const cameras = [];
-    for (const place of places) {
-      const props = {};
-      for (const p of place?.additionalProperties || []) {
-        if (p?.key) props[p.key] = p.value;
-      }
-      if (String(props.available).toLowerCase() !== 'true') continue;
-      const lat = toFiniteNumber(place?.lat);
-      const lon = toFiniteNumber(place?.lon);
-      if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
-      const imageUrl = String(props.imageUrl || '');
-      if (!imageUrl.startsWith(TFL_IMAGE_ORIGIN)) continue; // official-bucket pin
-
-      // "JamCams_00002.00865" → "tfl-00002.00865" (provider-stable id).
-      const rawId = String(place?.id || '').replace(/^JamCams_/, '');
-      if (!rawId) continue;
-      const cameraId = `tfl-${rawId}`;
-
-      cameras.push({
-        id: cameraId,
-        name: String(place?.commonName || `JamCam ${rawId}`),
-        city: 'London',
-        cityId: 'london',
-        provider: 'Transport for London',
-        lat,
-        lon,
-        // No heading signal at all in JamCam data → id-hash fallback, low
-        // confidence personality (same as headingless Austin cameras).
-        headingDeg: fallbackHeadingFromId(cameraId),
-        headingConfidence: 'low',
-        pitchDeg: -18,
-        fovDeg: 44,
-        rangeM: 145,
-        mountHeightM: 8,
-        groundElevationM: 15, // Thames-basin prior; one-shot snap corrects.
-        feedType: 'image', // stills-first (owner decision); props.videoUrl deliberately unused
-        url: imageUrl,
-        snapshotUrl: imageUrl,
-        sourceKind: 'tfl-open-data',
-        license: 'Powered by TfL Open Data',
-      });
-    }
-
-    const maxRaw = Number(process.env.CCTV_TFL_MAX_SOURCES || DEFAULT_TFL_MAX_SOURCES);
-    const maxCount = Number.isFinite(maxRaw) ? Math.max(8, Math.min(600, Math.floor(maxRaw))) : DEFAULT_TFL_MAX_SOURCES;
-    const prioritized = prioritizeSources(cameras, maxCount, [LONDON_CENTER]);
-    console.log(`[CCTV] Loaded TfL JamCam sources: ${cameras.length} available (using nearest ${prioritized.length})`);
-    return prioritized;
-  } catch (error) {
-    console.warn('[CCTV] TfL JamCam download error:', error?.message || error);
-    return [];
-  }
 }
 
 /**
@@ -4148,6 +4072,12 @@ function normalizeSourceItem(item) {
     snapshotUrl: typeof item.snapshotUrl === 'string' ? item.snapshotUrl : '',
     license: String(item.license || item.licenseNote || ''),
     sourceKind: String(item.sourceKind || item.kind || 'configured'),
+    // Durable Windy handle. `snapshotUrl` on a Windy row is only a seed — its
+    // token expires in 10 minutes — so /frame/ resolves through this id via
+    // resolveWindySnapshotUrl() instead of reading the stored URL.
+    windyWebcamId: item.windyWebcamId ? String(item.windyWebcamId) : '',
+    detailUrl: typeof item.detailUrl === 'string' ? item.detailUrl : '',
+    playerUrls: (item.playerUrls && typeof item.playerUrls === 'object') ? item.playerUrls : {},
     // Optional CAL badge input (cctv-v2 design §3b/§9.2, additive-only per the
     // global constraints — nothing else in this file changes): hand-authored
     // file/env catalog entries may declare poseSource:'curated' so the panel
@@ -4190,29 +4120,21 @@ async function refreshCctvSources() {
   const fromFile = loadSourcesFromFile();
   const fromEnv = loadSourcesFromEnv();
 
-  const forceAustin = String(process.env.CCTV_FORCE_AUSTIN || '').trim() === '1';
-  const preferAustin = String(process.env.CCTV_PREFER_AUSTIN || '1').trim() !== '0';
-  // Live open-data packs (Austin + Caltrans + TfL) load unless a file/env pack
-  // is configured and live packs aren't forced — same gate that governed the
-  // Austin-only fetch, now governing all three. Each pack fails independently.
-  const needsLiveSources = forceAustin || ((fromFile.length + fromEnv.length) === 0 && preferAustin);
-  const tflEnabled = String(process.env.CCTV_TFL_ENABLED || '1').trim() !== '0';
+  const forceWindy = String(process.env.CCTV_FORCE_WINDY || '').trim() === '1';
+  const windyEnabled = String(process.env.CCTV_WINDY_ENABLED || '1').trim() !== '0';
+  // The live Windy pack loads unless a file/env pack is configured and it is
+  // not forced — the same gate that governed the previous open-data packs.
+  // It fails independently: an outage yields [] and the serve-stale path below.
+  const needsLiveSources = windyEnabled
+    && (forceWindy || ((fromFile.length + fromEnv.length) === 0));
 
-  let fromAustin = [];
-  let fromCaltrans = [];
-  let fromTfl = [];
+  let fromWindy = [];
   if (needsLiveSources) {
-    const [austinResult, caltransResult, tflResult] = await Promise.allSettled([
-      loadAustinSourcesFromOpenData(),
-      loadCaltransSourcesFromOpenData(),
-      tflEnabled ? loadTflSourcesFromOpenData() : Promise.resolve([]),
-    ]);
-    fromAustin = austinResult.status === 'fulfilled' ? austinResult.value : [];
-    fromCaltrans = caltransResult.status === 'fulfilled' ? caltransResult.value : [];
-    fromTfl = tflResult.status === 'fulfilled' ? tflResult.value : [];
+    const [windyResult] = await Promise.allSettled([loadWindySourcesFromApi()]);
+    fromWindy = windyResult.status === 'fulfilled' ? windyResult.value : [];
   }
   // Live sources first so file/env overrides win on duplicate IDs (Map last-write).
-  const merged = [...fromAustin, ...fromCaltrans, ...fromTfl, ...fromFile, ...fromEnv];
+  const merged = [...fromWindy, ...fromFile, ...fromEnv];
 
   // Deduplicate by camera ID (last-write wins because of Map.set)
   const byId = new Map();
@@ -4468,6 +4390,61 @@ export async function fetchCctvImageFromUpstream(url, {
  *
  * @returns {import('vite').Plugin}
  */
+/**
+ * Vite plugin: Antenas proxy — SKELETON.
+ *
+ * Endpoint:
+ *   GET /api/antenas — the antena catalogue
+ *
+ * No upstream is chosen yet, so this answers an empty, well-formed payload.
+ * That is deliberate: the layer then reports an honest "0 antenas" instead of
+ * erroring, and the contract downstream is already exercised.
+ *
+ * When the real source lands, the house rules for this file apply — see
+ * documentation/4-server/server-proxies.md:
+ *   - validate and bound EVERY client input (never trust a client-supplied
+ *     upstream URL; that is the SSRF control the CCTV proxy also enforces);
+ *   - cap the upstream response and time it out;
+ *   - cache in memory (and on disk if the payload is large or slow);
+ *   - single-flight concurrent refreshes and serve stale on a failed refresh;
+ *   - sanitize errors — never forward an upstream body or a key;
+ *   - add a budget governor if the upstream is metered;
+ *   - read any credential from process.env and register it in keySetupCore.mjs.
+ *
+ * Parsing belongs in src/data/antenasParse.js, which this plugin and the
+ * browser layer both import, so the two can never disagree about a record.
+ *
+ * @returns {import('vite').Plugin}
+ */
+function antenasProxy() {
+  return {
+    name: 'antenas-proxy',
+    configureServer(server) {
+      server.middlewares.use('/api/antenas', async (req, res) => {
+        const url = new URL(req.url || '/', 'http://localhost');
+        if (url.pathname !== '/' && url.pathname !== '') {
+          res.writeHead(404, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+          res.end(JSON.stringify({ error: 'not found' }));
+          return;
+        }
+        try {
+          // TODO(populate): fetch upstream, then
+          //   parseAntenasPayload(await response.json())
+          // and serve the normalized records.
+          const antenas = [];
+          res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+          res.end(JSON.stringify({ antenas, source: null, updatedAt: Date.now() }));
+        } catch (error) {
+          // Sanitized: the client learns the request failed, never why.
+          console.warn('[Antenas] proxy error:', error?.message || error);
+          res.writeHead(502, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+          res.end(JSON.stringify({ error: 'Antenas upstream unavailable' }));
+        }
+      });
+    },
+  };
+}
+
 function cctvProxy() {
   /** @type {Map<string,{id:string,status:string,sourceKind:string,label:string,message:string,updatedAt:number}>} */
   const health = new Map();
@@ -4574,6 +4551,8 @@ function cctvProxy() {
                 sourceKind: source.sourceKind || (source.url ? 'configured' : 'fallback'),
                 poseSource: source.poseSource,
                 license: source.license,
+                detailUrl: source.detailUrl,
+                playerUrls: source.playerUrls,
               })),
             };
             res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
@@ -4685,11 +4664,21 @@ function cctvProxy() {
 
           // Only use server-registered upstream URLs — never accept client-supplied URLs
           // (prevents SSRF via ?upstream= query parameter)
-          const upstreamCandidate =
-            source?.snapshotUrl
-            || (!isVideoFeedType(normalizeFeedType(source?.feedType)) ? source?.url : '');
+          const upstreamCandidate = source?.windyWebcamId
+            ? await resolveWindySnapshotUrl(source.windyWebcamId, source.snapshotUrl)
+            : (source?.snapshotUrl
+              || (!isVideoFeedType(normalizeFeedType(source?.feedType)) ? source?.url : ''));
 
-          const upstreamImage = await fetchCctvImageFromUpstream(upstreamCandidate);
+          let upstreamImage = await fetchCctvImageFromUpstream(upstreamCandidate);
+          // A Windy image token that expired mid-TTL answers 401, which reads
+          // here as a plain miss. One forced re-resolve turns that into a live
+          // frame instead of dropping the camera to the Street View fallback.
+          if (!upstreamImage?.ok && source?.windyWebcamId) {
+            const refreshed = await resolveWindySnapshotUrl(source.windyWebcamId, '', { force: true });
+            if (refreshed && refreshed !== upstreamCandidate) {
+              upstreamImage = await fetchCctvImageFromUpstream(refreshed);
+            }
+          }
           if (upstreamImage?.ok) {
             setHealth(cameraId, {
               status: 'ok',
@@ -5723,7 +5712,7 @@ const GEV_REALTIME_TOOLS = [
         layerId: {
           type: 'string',
           description:
-            'Common-name mapping for the non-obvious ids: space mission(s) → rocket-launches; fires/wildfires/active fires → local-firms (NASA FIRMS); ships/vessels/boats → ais-live-vessels; undersea/submarine cables → telegeography-submarine-cables; datacenters → local-datacenters; dams → local-dams; bikes/bike share → bikeshare; street traffic/congestion → traffic; traffic cameras → cctv; internet radio/stations → radio.',
+            'Common-name mapping for the non-obvious ids: space mission(s) → rocket-launches; fires/wildfires/active fires → local-firms (NASA FIRMS); ships/vessels/boats → ais-live-vessels; undersea/submarine cables → telegeography-submarine-cables; datacenters → local-datacenters; dams → local-dams; bikes/bike share → bikeshare; street traffic/congestion → traffic; traffic cameras → cctv; internet radio/stations → radio; antennas/masts/towers → antenas.',
           enum: [
             'flights',
             'military',
@@ -5739,6 +5728,7 @@ const GEV_REALTIME_TOOLS = [
             'local-dams',
             'telegeography-submarine-cables',
             'local-firms',
+            'antenas',
           ],
         },
         enabled: { type: 'boolean' },
@@ -5770,6 +5760,7 @@ const GEV_REALTIME_TOOLS = [
             'local-dams',
             'telegeography-submarine-cables',
             'local-firms',
+            'antenas',
           ],
           description: 'Optional layer row to scroll into view and highlight.',
         },
@@ -5872,6 +5863,7 @@ const GEV_REALTIME_TOOLS = [
             'local-dams',
             'telegeography-submarine-cables',
             'local-firms',
+            'antenas',
           ],
           description: 'Optional layer filter for visible entity context.',
         },
@@ -5982,14 +5974,14 @@ const GEV_REALTIME_TOOLS = [
   {
     type: 'function',
     name: 'control_cctv',
-    description: 'CCTV camera operations: enable/disable the layer, select a camera by name, next/prev/nearest/focus, toggle coverage wedges / projection overlay / auto-hop, "viewshed" for color-coded per-camera coverage volumes, and "adjust" for the on-camera calibration gizmo.',
+    description: 'CCTV camera operations: enable/disable the layer, select a camera by name, next/prev/nearest/focus, and toggle auto-hop. Selecting a camera recentres the view overhead at the current altitude and opens its panel; there are no coverage, projection or calibration-gizmo controls.',
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
-        action: { type: 'string', enum: ['enable', 'disable', 'select', 'next', 'prev', 'nearest', 'focus', 'coverage', 'viewshed', 'adjust', 'projection', 'autohop'] },
+        action: { type: 'string', enum: ['enable', 'disable', 'select', 'next', 'prev', 'nearest', 'focus', 'autohop'] },
         cameraQuery: { type: 'string', description: 'Camera name or id for select.' },
-        enabled: { type: 'boolean', description: 'Explicit on/off for coverage/viewshed/adjust/projection/autohop; omit to toggle.' },
+        enabled: { type: 'boolean', description: 'Explicit on/off for autohop; omit to toggle.' },
       },
       required: ['action'],
     },
@@ -7695,6 +7687,7 @@ export default defineConfig(({ mode }) => {
       regionalBriefProxy(),
       weatherEffectsProxy(),
       cctvProxy(),
+      antenasProxy(),
       radioBrowserProxy(),
       gbfsProxy(),
       adsbLolProxy(),

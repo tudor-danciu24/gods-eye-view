@@ -87,6 +87,14 @@ export const KEY_SETUP_KEYS = Object.freeze([
     tier: 'free',
   }),
   Object.freeze({
+    id: 'windy-webcams',
+    title: 'WINDY WEBCAMS',
+    unlocks: 'The CCTV camera network (worldwide public webcams)',
+    getUrl: 'https://api.windy.com/webcams',
+    envVars: Object.freeze(['WINDY_WEBCAMS_API_KEY']),
+    tier: 'free',
+  }),
+  Object.freeze({
     id: 'launch-library',
     title: 'LAUNCH LIBRARY',
     unlocks: 'Higher space-missions request allowance',
